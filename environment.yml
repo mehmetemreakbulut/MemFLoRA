@@ -1,0 +1,11 @@
+# Run from the repository root: conda env create -f environment.yml
+# Pinned dependencies come from pyproject.toml; the original complete environment
+# is preserved separately in requirements-lock.txt.
+name: memflora
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -e .[dev]

@@ -1,0 +1,4 @@
+# Runtime and test dependencies are pinned once in pyproject.toml.
+# Install from the repository root: pip install -r requirements.txt
+# The original full environment snapshot remains in requirements-lock.txt.
+-e .[dev]

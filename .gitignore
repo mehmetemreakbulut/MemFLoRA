@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Output directories are anchored with a leading "/" so they match only at the
+# repo root. An unanchored pattern like `data/` matches a directory of that name
+# at ANY depth -- that is what silently excluded the src/data/ loader package.
+# Anchored entries need no trailing slash, so they also match a symlink into
+# shared storage (as `data` is here). Extension patterns below stay unanchored
+# on purpose: those should match anywhere.
+
+# Datasets (see docs/DATA.md for how to obtain them)
+/data
+
+# Model checkpoints (regenerate via pretraining; see docs/REPRODUCIBILITY.md)
+/checkpoints
+/experiments/checkpoints
+*.pt
+*.pth
+
+# New experiment output (reference results live in results/)
+/runs
+# Injection/minimalization report CSVs the runner writes as a side effect
+/experiments/results
+
+# Run logs and archives
+/logs
+*.log
+*.zip
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

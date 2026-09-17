@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memflora"
+version = "0.1.0"
+description = "MemFLoRA: memory-efficient adapter-based domain adaptation for on-device human activity recognition"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Mehmet Emre Akbulut" }]
+keywords = ["parameter-efficient-fine-tuning", "lora", "on-device-learning", "human-activity-recognition", "domain-adaptation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Pinned to the environment that produced the reported results.
+dependencies = [
+    "numpy==2.4.6",
+    "scikit-learn==1.8.0",
+    "pillow==12.2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.0.3", "black==26.5.1"]
+
+[tool.setuptools]
+# The import root is `src` (modules are imported as `from src.adapters import ...`),
+# matching the layout the experiments were run with.
+packages = { find = { include = ["src*"] } }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+# A few error-message strings and `# type: ignore` pragmas exceed this; black
+# does not split string literals, and the pragmas must stay on their own line.
