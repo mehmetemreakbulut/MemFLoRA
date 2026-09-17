@@ -161,6 +161,50 @@ def storage_bytes(tensors) -> int:
     return total
 
 
+def check_cuda_kernels(torch, device) -> None:
+    """Run one real GPU kernel now, instead of failing minutes into the run."""
+    major, minor = torch.cuda.get_device_capability(device)
+    arch = f"sm_{major}{minor}"
+    built_for = torch.cuda.get_arch_list()
+    try:
+        value = torch.arange(8, device=device, dtype=torch.float32).mul_(2).sum()
+        torch.cuda.synchronize(device)
+        assert float(value) == 56.0
+    except (RuntimeError, AssertionError) as error:
+        raise SystemExit(
+            f"This PyTorch build cannot run code on "
+            f"{torch.cuda.get_device_name(device)} ({arch}); "
+            f"it was built for {', '.join(built_for)}.\n"
+            f"Original error: {error}\n"
+            "On a Jetson, install the PyTorch wheel NVIDIA builds for your JetPack "
+            "release instead of the one from PyPI."
+        ) from None
+    if arch not in built_for:
+        print(
+            f"warning: this PyTorch build does not list {arch}. A basic kernel ran, "
+            "but later cuDNN or cuBLAS calls may still fail.",
+            file=sys.stderr,
+        )
+
+
+def synthetic_loaders(torch, args, batch_size: int) -> dict:
+    """Random windows with the shape and label range the real loader produces."""
+    from torch.utils.data import DataLoader, TensorDataset
+
+    generator = torch.Generator().manual_seed(SEED)
+    count = batch_size * 8
+    windows = torch.randn(
+        count, args.expected_input_channels, args.window_size, generator=generator
+    )
+    labels = torch.randint(args.expected_num_classes, (count,), generator=generator)
+    dataset = TensorDataset(windows, labels)
+    return {
+        "Shift_train": DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, generator=generator
+        )
+    }
+
+
 def parse_cli() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -180,6 +224,12 @@ def parse_cli() -> argparse.Namespace:
         "--cudnn-benchmark",
         action="store_true",
         help="let cuDNN search algorithms; this can grow the workspace a lot",
+    )
+    parser.add_argument(
+        "--synthetic-data",
+        action="store_true",
+        help="use random windows of the real shape instead of loading Opportunity; "
+        "the training numbers are identical, the dataset rows become n/a",
     )
     parser.add_argument("--json", type=Path, help="also write raw bytes here")
     return parser.parse_args()
@@ -227,6 +277,7 @@ def main() -> int:
         torch.backends.cudnn.benchmark = cli.cudnn_benchmark
         torch.cuda.init()
         torch.zeros(1, device=device)
+        check_cuda_kernels(torch, device)
     after_context = rec.snapshot("cuda context")
 
     argv = BENCHMARK_ARGV + [
@@ -250,13 +301,25 @@ def main() -> int:
         }
     )
 
-    with tempfile.TemporaryDirectory() as scratch:
-        arrays = load_minimal_dataset_arrays(args, Path(scratch))
-    after_dataset = rec.snapshot("dataset arrays")
-
-    split = build_minimal_split(args, arrays, cli.target_subject, SEED)
-    loaders = make_loaders(split, cli.batch_size, SEED)
-    after_split = rec.snapshot("split and loaders")
+    if cli.synthetic_data:
+        after_dataset = rec.snapshot("dataset arrays")
+        loaders = synthetic_loaders(torch, args, cli.batch_size)
+        after_split = rec.snapshot("synthetic batches")
+    else:
+        try:
+            with tempfile.TemporaryDirectory() as scratch:
+                arrays = load_minimal_dataset_arrays(args, Path(scratch))
+        except FileNotFoundError as error:
+            print(
+                f"{error}\nPoint --data-root at the Opportunity folder, or pass "
+                "--synthetic-data to measure without the dataset.",
+                file=sys.stderr,
+            )
+            return 2
+        after_dataset = rec.snapshot("dataset arrays")
+        split = build_minimal_split(args, arrays, cli.target_subject, SEED)
+        loaders = make_loaders(split, cli.batch_size, SEED)
+        after_split = rec.snapshot("split and loaders")
 
     model = build_backbone(trial).to(device)
     configure_method(model, trial)
@@ -398,8 +461,14 @@ def main() -> int:
             + (outside_allocator(after_calibration, after_warmup) or 0),
         ),
         ("Host data", None),
-        ("Dataset arrays, all subjects", delta(after_context, after_dataset, "rss")),
-        ("Split tensors and loaders", delta(after_dataset, after_split, "rss")),
+        (
+            "Dataset arrays, all subjects",
+            None if cli.synthetic_data else delta(after_context, after_dataset, "rss"),
+        ),
+        (
+            "Split tensors and loaders",
+            None if cli.synthetic_data else delta(after_dataset, after_split, "rss"),
+        ),
         ("Live between steps", None),
         ("Weights and buffers", weights),
         ("Adam optimizer state", optimizer_state),
