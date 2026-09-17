@@ -1,104 +1,178 @@
 # MemFLoRA
 
-Memory-efficient adapter-based domain adaptation for on-device human activity
-recognition.
+Memory-Floor LoRA: low-rank adapters for fine-tuning CNNs on small devices,
+where the thing you run out of is memory, not parameters.
 
-This repository contains the code and the reference results for the MemFLoRA
-paper. Every experiment in the paper has a script in `scripts/`, and the output
-that script produced is committed under `results/` — so the tables and figures can
-be checked without re-running anything, and a re-run can be diffed against the
-original.
+Cutting the  number of trainable weights shrinks the gradients and the optimizer state, but for
+a convolutional network those were never the big cost. The big cost is the
+activations that autograd keeps around for the backward pass, and a normal LoRA
+adapter still keeps every one of them at full width.
 
-## What is here
+MemFLoRA is built around that problem instead. The rule it follows is simple: no
+trainable part of the backward pass is allowed to need a full-width activation.
+To get there it
 
-```text
-scripts/     21 experiment scripts, plus a smoke test
-results/     the output those scripts produced, grouped by paper section
-experiments/ the benchmark runner
-src/         adapters, backbones, dataset loaders, memory/performance profiling
-tests/       unit tests (no dataset needed)
-docs/        DATA.md — how to get the datasets
-             REPRODUCIBILITY.md — experiment index and how to re-run
-```
+- freezes the down-projection and only trains the up-projection, so the only
+  thing saved for the adapter is a rank-`r` bottleneck,
+- runs the backbone's BatchNorm in eval mode, which turns it into a fixed affine
+  map with nothing to save,
+- stores the ReLU mask as packed bits instead of a float tensor, and
+- scales the adapter output by the frozen BatchNorm scale, so it lives on the same
+  scale as the backbone it's added to.
 
-## Quickstart
+There's also an optional variant, MemFLoRA-SG, that recovers the gradient for the
+frozen projection by replaying the forward pass, so the projection can learn too
+without keeping full-width activations around.
 
-```bash
-make install                # pinned deps + editable install
-make test                   # unit tests, no data required
-# put the datasets in place — see docs/DATA.md
-make smoke                  # few-minute end-to-end check
-./scripts/01_main_accuracy_opportunity_t_resnet.sh
-```
+The code was written for sensor-based human activity recognition, but nothing in
+the adapter itself is specific to that.
 
-New runs go to `$RESULTS_ROOT` (default `runs/`) and never overwrite `results/`.
+## Method names
 
-## The method
+The method names in the code are internal ones that stuck around from
+development. The two you probably care about:
 
-MemFLoRA adapts a frozen convolutional backbone to a new target domain by
-inserting low-rank adapters whose backward pass does not require the full-precision
-input activations that dominate training-time SRAM. Two variants are reported:
-
-| Paper name | Code name |
+| Name | In the code |
 |---|---|
 | MemFLoRA | `bnpa_fa_postbn_bnr_off_scaled` |
 | MemFLoRA-SG | `bnpa_q3_sg` |
 
-Baselines: full fine-tuning, BN-tuning, bias-tuning, LoRA-C, LoRA-Edge, TinyTL
-lite-residual, and the unadapted source model (`zero_shot`).
+The baselines are `zero_shot` (no adaptation), `full` (full fine-tuning),
+`bn_tuning`, `bias_tuning`, `lora_c`, `lora_edge_optimized`, and the
+`tinytl_lite_residual_bias*` family. The full list lives in `src/methods.py`.
 
-## Headline numbers
+## Setup
 
-Opportunity + T-ResNet, leave-one-subject-out, 40 seeds, 50 adaptation steps —
-from `results/main_accuracy/opportunity_t_resnet/minimal_benchmark_summary.csv`:
+You'll need Python 3.11 or newer.
 
-| Method | Rank | Macro-F1 | ± stderr |
-|---|---|---|---|
-| Full fine-tuning | — | 0.8435 | 0.0012 |
-| MemFLoRA-SG | 8 | 0.8092 | 0.0024 |
-| **MemFLoRA** | **8** | **0.8058** | **0.0023** |
-| LoRA-C | 8 | 0.7962 | 0.0026 |
-| LoRA-Edge | 8 | 0.7641 | 0.0030 |
-| BN-tuning | — | 0.6766 | 0.0045 |
-| Bias-tuning | — | 0.6502 | 0.0050 |
-| Source model, no adaptation | — | 0.5126 | 0.0039 |
+```bash
+pip install -r requirements.txt     # or: make install
+```
 
-Peak training SRAM for the same backbone, batch size 64 — from
-`results/memory_profiling/opportunity_t_resnet/full_sram_summary.csv`:
+That installs the repo in editable mode along with pinned versions of torch,
+torchvision, numpy, scikit-learn and pillow, plus pytest and black. If you prefer
+conda, `conda env create -f environment.yml` does the same thing.
 
-| Method | Rank | Peak SRAM |
-|---|---|---|
-| Full fine-tuning | — | 60.5 MiB |
-| LoRA-C | 2 | 57.0 MiB |
-| BN-tuning | — | 54.8 MiB |
-| LoRA-Edge | 2 | 38.2 MiB |
-| **MemFLoRA** | **2** | **3.1 MiB** |
+`requirements-lock.txt` is a full `pip freeze` of the machine the code was
+developed on. You don't need it for normal use, and it pins CUDA packages that
+will only install on Linux.
 
-MemFLoRA reaches within ~4 macro-F1 points of full fine-tuning at rank 8 while
-training in roughly a twentieth of the peak SRAM at rank 2. These are the
-Opportunity/T-ResNet numbers; RealDisp and RealWorld results, both backbones, are
-in `results/main_accuracy/`.
+## Data
 
-## Reproducing
+The datasets aren't included, so you'll have to download them yourself. The code
+supports three public HAR datasets: Opportunity, RealDisp and RealWorld (HAR). By
+default it looks for them under `data/<dataset>`, laid out like this:
 
-`docs/REPRODUCIBILITY.md` has the full index: which script produces which results
-folder, what each supports in the paper, what the shipped files contain, and what
-should and should not reproduce exactly on different hardware.
+```text
+data/
+├── opportunity/
+│   └── OpportunityUCIDataset/dataset/S1-ADL1.dat ...
+├── realdisp/
+│   └── subject1_ideal.log, subject1_self.log ...
+└── realworld/
+    └── realworld2016_dataset/proband1/data/acc_walking_csv.zip ...
+```
 
-Dependencies are declared in `pyproject.toml`; `requirements-lock.txt` preserves
-the original complete environment. RealDisp always uses the NumPy parser, so
-installing pandas cannot change preprocessing. Datasets are not included; see
-`docs/DATA.md` for their expected layout.
+The loaders search these folders fairly loosely, so small differences in nesting
+are usually fine. If your data lives somewhere else, pass `--data-root`.
 
-New results use compact CSV schemas: 20 core trial fields, with SG counters and
-time-to-threshold fields included only when relevant. `target_domain` identifies
-the subject, location, or scenario. Historical reference files retain their
-original columns. Profiling is opt-in; the profiling scripts enable it explicitly.
+## Running things
 
-## Citation
+Start with the smoke test. It trains for one epoch on a single Opportunity subject
+and finishes in a few minutes, which is enough to tell you the data, the model
+and the adapters are all wired up correctly. Don't read anything into its
+accuracy.
 
-A citation entry will be added on publication.
+```bash
+make smoke
+```
+
+Everything goes through one entry point, `experiments/minimal_methods_benchmark.py`.
+Here's a realistic run: MemFLoRA at rank 4 on Opportunity with a T-ResNet, every
+subject held out in turn, five seeds, 50 adaptation steps.
+
+```bash
+python experiments/minimal_methods_benchmark.py \
+  --dataset opportunity --backbone t_resnet_official \
+  --method bnpa_fa_postbn_bnr_off_scaled \
+  --rank 4 --target-subjects all --seed 1 2 3 4 5 \
+  --window-size 60 --window-stride 30 \
+  --label-column ml_both_arms --window-label-rule majority \
+  --pretrain-epochs 20 --steps-adapt 50 --batch-size 64 \
+  --reuse-first-source-model true --adapt-eval-every-steps 50 \
+  --adapter-layers all --adabn-calibration-mode ema_no_reset \
+  --adabn-calib-batches 1 --proj-init random --bnpa-bottleneck-bn on \
+  --adabn-stat-source target --train_mode_adaBN off --adapt-lr 1e-3 \
+  --results-root runs
+```
+
+Most arguments accept several values and the runner sweeps over all of them, so
+`--method zero_shot full bnpa_fa_postbn_bnr_off_scaled --rank 2 4 8` runs every
+combination. Each run gets its own dated folder under `--results-root`, with the
+exact command, the resolved config, a CSV row per trial and a summary CSV.
+
+A few things that tripped me up and might trip you up too:
+
+- **`--adabn-calib-batches` defaults to `all`.** If you want AdaBN calibrated on a
+  single batch of target data, pass `1` explicitly.
+- **`--reuse-first-source-model true` saves a lot of time.** The source model is
+  pretrained once per target and reused across seeds. Setting it to `false`
+  retrains from scratch for every seed, which is more independent but much slower.
+- **CPU works, it's just slow.** A 20-epoch Opportunity pretrain takes a few
+  minutes on a CPU. Big sweeps really want a GPU.
+- **MobileNetV2 wants `--adapter-layers pointwise_only`.** The MemFLoRA adapter
+  only supports ungrouped convolutions, and MobileNetV2 is full of depthwise ones.
+
+For memory numbers, add `--profile-full-sram true`, and for multiply-accumulate
+counts add `--profile-performance true`. Both write their own CSVs next to the
+trial results.
+
+The `scripts/` folder has ready-made sweeps grouped by what they measure:
+accuracy, convergence over adaptation steps, memory profiling, design ablations, a
+TinyTL comparison and adaptation time. You can run a single script or a whole
+group:
+
+```bash
+./scripts/15_ablations_geometry.sh
+./scripts/run_all.sh ablations
+```
+
+Output goes to `$RESULTS_ROOT`, which defaults to `runs/`. Some of these sweeps
+are large and take days on a CPU, so read a script before you start it.
+
+## What's where
+
+```text
+src/
+  adapters/     the MemFLoRA blocks and their hand-written backward passes,
+                plus LoRA-C, LoRA-Edge, TinyTL and the frozen minimal blocks
+  models/       T-ResNet and MobileNetV2, and the code that injects adapters
+  data/         loaders for the three datasets and the train/test splits
+  profiling/    saved-tensor SRAM accounting and MAC counting
+  utils/        AdaBN helpers, bit packing, CSV writing
+  methods.py    method names and which settings each one uses
+  train.py      AdaBN calibration
+experiments/    the benchmark runner: CLI, training loop, reporting
+scripts/        shell wrappers around the runner
+tests/          unit tests, no datasets needed
+```
+
+If you want to understand the method, start with
+`src/adapters/bnpa_conv_bn_act_2d.py`. The forward and backward of the fused
+Conv–BN–ReLU block are written out by hand there, and that's where the memory
+savings actually happen.
+
+## Tests and formatting
+
+```bash
+make test
+black --check src experiments tests
+```
+
+The tests don't need any data. They check bit packing, compare the BNPA backward
+against a plain autograd reference, and exercise adapter injection and the CSV
+output. Code is formatted with black at the default 88 columns.
 
 ## License
 
-MIT — see `LICENSE`.
+MIT. See `LICENSE`.
