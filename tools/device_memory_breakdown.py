@@ -23,6 +23,7 @@ import argparse
 import json
 import sys
 import tempfile
+import time
 from copy import deepcopy
 from pathlib import Path
 
@@ -106,7 +107,12 @@ class Recorder:
         return self.device is not None and self.device.type == "cuda"
 
     def snapshot(self, stage: str) -> dict:
-        row = {"stage": stage, "rss": process_rss(), "system_used": system_used()}
+        row = {
+            "stage": stage,
+            "time": time.time(),
+            "rss": process_rss(),
+            "system_used": system_used(),
+        }
         if self.cuda:
             torch = self.torch
             torch.cuda.synchronize(self.device)
@@ -354,7 +360,7 @@ def main() -> int:
             eval_overhead = torch.cuda.max_memory_allocated(device) - eval_before
     model.train()
     freeze_bn_eval(model)
-    final = rec.snapshot("end")
+    final = rec.snapshot("saved-tensor step and eval")
 
     weights = storage_bytes([*model.parameters(), *model.buffers()])
     optimizer_state = storage_bytes(
