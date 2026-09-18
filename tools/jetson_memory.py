@@ -6,9 +6,9 @@
 Each method runs in a fresh process. The CUDA allocator trace reports requested
 and reserved peaks separately, plus the training-state maximum and the category
 breakdown at the overall requested peak. The report calls requested bytes memory
-"used" and shows reserved memory separately. Whole-device RAM is estimated from
-Linux MemTotal - MemAvailable and includes the OS and other programs; it is never
-added to the CUDA totals.
+"used" and shows reserved memory separately. RAM comes from Linux's counters for
+the training process itself (VmHWM, VmRSS), so no figure depends on other programs
+or on which method ran first.
 
 The report is served at http://127.0.0.1:8000 and refreshes itself every second.
 Over SSH, open a tunnel first: ssh -L 8000:localhost:8000 <jetson>. Press Ctrl+C
@@ -18,6 +18,9 @@ The step uses random weights and random windows of the Opportunity shape (97
 channels x 60 steps). This is a synthetic memory experiment, not a paper accuracy
 run. AdaBN calibration is skipped unless --use-adabn is given. The optional CUDA
 packing extension is prepared before warm-up; its first use may compile it.
+Both methods run with small cuBLAS workspaces and expandable allocator segments
+(CUBLAS_WORKSPACE_CONFIG=:16:8, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True)
+unless those variables are already set.
 """
 
 from __future__ import annotations
@@ -36,7 +39,6 @@ import sys
 import threading
 import time
 import webbrowser
-from copy import deepcopy
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,33 +88,40 @@ MARK = "@jetson_memory "  # marks the lines a measuring child sends back
 LOCK = threading.Lock()
 
 
-def device_memory() -> dict:
-    """Estimated whole-device RAM use, not memory attributable to this process.
+def process_memory(pid="self") -> dict:
+    """Linux's own RAM counters for one process, from /proc/<pid>/status.
 
-    MemAvailable accounts for memory Linux can reclaim for new applications:
-    https://docs.kernel.org/filesystems/proc.html#meminfo
+    VmHWM is the most the process ever held, VmRSS what it holds now; RssFile is
+    the part mapped from files such as shared libraries. Being per process, none
+    of them depends on other programs or on which method ran first.
     """
+    keys = ("VmHWM:", "VmRSS:", "RssAnon:", "RssFile:", "RssShmem:")
     try:
-        with open("/proc/meminfo") as f:
+        with open(f"/proc/{pid}/status") as f:
             info = {
                 line.split(":")[0]: int(line.split()[1]) * 1024
                 for line in f
-                if line.startswith(("MemTotal:", "MemAvailable:"))
+                if line.startswith(keys)
             }
-        return {
-            "device_ram_used": info["MemTotal"] - info["MemAvailable"],
-            "device_ram_total": info["MemTotal"],
-        }
-    except (OSError, KeyError, ValueError):
-        return {"device_ram_used": None, "device_ram_total": None}
+    except OSError:  # the process has exited
+        return {}
+    if "VmRSS" not in info:  # exited, not yet reaped
+        return {}
+    return {
+        "process_peak": info["VmHWM"],
+        "process_rss": info["VmRSS"],
+        "process_private": info["RssAnon"] + info["RssShmem"],
+        "process_files": info["RssFile"],
+    }
 
 
 class Monitor(threading.Thread):
-    """Samples whole-device RAM, GPU, CPU and power every 0.5 s."""
+    """Samples the training process's RAM, and GPU, CPU and power, every 0.5 s."""
 
     def __init__(self, samples: list) -> None:
         super().__init__(daemon=True)
         self.samples, self.process = samples, None
+        self.pid: int | None = None  # the training process being measured
 
     def run(self) -> None:
         if shutil.which("tegrastats"):
@@ -135,8 +144,10 @@ class Monitor(threading.Thread):
                 self.add({"cpu": sum(loads) / len(loads), "cpu_max": max(loads)})
 
     def add(self, sample: dict) -> None:
-        used = device_memory()["device_ram_used"]
-        sample["device_ram"] = used / 1e6 if used is not None else None
+        memory = process_memory(self.pid) if self.pid else {}
+        if memory:
+            sample["process_ram"] = memory["process_rss"] / 1e6
+            sample["process_private"] = memory["process_private"] / 1e6
         with LOCK:
             self.samples.append({"t": time.time(), **sample})
 
@@ -342,25 +353,30 @@ def provenance(cli, method, torch, device):
         "empty_cache_after_calibration": cli.empty_cache_after_calibration,
         "trace_stacks": cli.trace_stacks,
         "synthetic_inputs": True,
-        "device_ram_measure": "MemTotal - MemAvailable; whole device, includes other programs",
+        "process_ram_measure": "VmHWM and VmRSS of the training process",
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
     }
 
 
 def measure(cli, method: str) -> None:
     """Measure one method. Runs in a child process and emits what it finds."""
+    # Cheap runtime savings, the same for both methods; variables already set win.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")  # 128 KiB, not 8 MiB
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     torch = None
     device = None
 
     def stage(name: str) -> dict:
         if device is not None and device.type == "cuda":
             torch.cuda.synchronize()
-        row = {"name": name, "t": time.time(), **device_memory()}
+        row = {"name": name, "t": time.time(), **process_memory()}
         if device is not None and device.type == "cuda":
             row["reserved"] = torch.cuda.memory_reserved()
         emit(stage=row)
         return row
 
-    initial = stage("start")
+    stage("start")
     import torch
 
     stage("import torch")
@@ -371,6 +387,7 @@ def measure(cli, method: str) -> None:
     from experiments.benchmark_cli import apply_dataset_defaults, parse_args
     from experiments.benchmark_common import method_forces_bn_eval
     from experiments.benchmark_common import prepare_batch_inputs
+    from experiments.benchmark_training import changing_state
     from experiments.minimal_methods_benchmark import build_backbone, configure_method
     from src.train import freeze_bn_eval
 
@@ -385,6 +402,14 @@ def measure(cli, method: str) -> None:
         torch.zeros(1, device=device).add_(1).item()  # fails early on a wrong build
     torch.manual_seed(1)
     stage("cuda context")
+    gpu_in_rss = None
+    if device.type == "cuda":  # do this process's GPU buffers count toward its RSS?
+        rss = process_memory()["process_rss"]
+        probe = torch.ones(32 * 2**20, dtype=torch.uint8, device=device)
+        torch.cuda.synchronize()
+        gpu_in_rss = process_memory()["process_rss"] - rss >= 24 * 2**20
+        del probe
+        torch.cuda.empty_cache()
     if device.type == "cuda" and method != "full":
         from src.utils._bitpack_cuda import cuda_extension
 
@@ -422,7 +447,7 @@ def measure(cli, method: str) -> None:
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(params, lr=1e-3, weight_decay=args.adapt_weight_decay)
     loss_fn = torch.nn.CrossEntropyLoss()
-    checkpoint = deepcopy(model.state_dict())  # the runner keeps the best weights
+    checkpoint = changing_state(model, optimizer)  # what the runner keeps as best
     batch_x, y = (tensor.to(device) for tensor in next(iter(loader)))
     x = prepare_batch_inputs(batch_x, args.backbone)
     bn_eval = method_forces_bn_eval(method)  # MemFLoRA freezes BN, full FT does not
@@ -504,6 +529,7 @@ def measure(cli, method: str) -> None:
     if cuda:
         snapshot = torch.cuda.memory._snapshot()
         trace = snapshot["device_traces"][device.index]
+        expandable = any(s.get("is_expandable") for s in snapshot["segments"])
         torch.cuda.memory._record_memory_history(None)
         kinds = {address: row for address, (row, _) in saved.items()}
         found, metrics, timeline = attribute(
@@ -546,7 +572,7 @@ def measure(cli, method: str) -> None:
         }
         # CPU bookkeeping is not a live-memory trace; never label it a peak.
         unmeasured = set(rows)
-        verified = timeline = None
+        verified = timeline = expandable = None
         checks = {}
 
     groups = [
@@ -577,13 +603,15 @@ def measure(cli, method: str) -> None:
             "Saved for backward",
             metrics["forward_saved_activations"] + metrics["forward_saved_bitmasks"],
         ],
-        ["Whole-device RAM in use", s_done["device_ram_used"]],
+        ["Peak process RAM", s_done["process_peak"]],
+        ["Process RAM after the step", s_done["process_rss"]],
     ]
     metrics.update(
-        device_ram_before=initial["device_ram_used"],
-        device_ram_after=s_done["device_ram_used"],
-        device_ram_total=s_done["device_ram_total"],
+        {key: s_done[key] for key in ("process_private", "process_files")},
+        gpu_in_rss=gpu_in_rss,
     )
+    metadata = provenance(cli, method, torch, device)
+    metadata["expandable_segments_active"] = expandable
     emit(
         device=str(device),
         verified=verified,
@@ -593,14 +621,15 @@ def measure(cli, method: str) -> None:
         timeline=timeline,
         metrics=metrics,
         checks=checks,
-        metadata=provenance(cli, method, torch, device),
+        metadata=metadata,
     )
 
 
-def run_child(label: str, method: str, report: dict) -> None:
+def run_child(label: str, method: str, report: dict, monitor: Monitor) -> None:
     """Measure one method in a fresh process, so it pays for its own libraries."""
     command = [sys.executable, __file__, *sys.argv[1:], "--child", method]
     child = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    monitor.pid = child.pid  # the RAM chart follows this process
     assert child.stdout  # piped above
     for line in child.stdout:
         if not line.startswith(MARK):
@@ -615,6 +644,7 @@ def run_child(label: str, method: str, report: dict) -> None:
         if message.get("verified") is False:
             print(f"{label}: the allocator trace does not match PyTorch's peak")
     code = child.wait()
+    monitor.pid = None
     if code:
         print(f"{label}: the measurement failed, see the error above")
 
@@ -733,7 +763,7 @@ def main() -> int:
 
     for label in report["runs"]:
         time.sleep(3)  # a short gap between the runs on the charts
-        run_child(label, RUNS[label], report)
+        run_child(label, RUNS[label], report, monitor)
     with LOCK:
         report["done"] = True
     print()
@@ -831,7 +861,8 @@ const $ = (id) => document.getElementById(id);
 const MB = (b) => (b == null ? "n/a" : (b / 1e6).toFixed(2) + " MB");
 const NS = "http://www.w3.org/2000/svg";
 const CHARTS = [
-  ["Whole-device RAM in use", "MB", [["RAM in use", "device_ram"]]],
+  ["RAM of the training process", "MB",
+    [["Resident (RSS)", "process_ram"], ["Private", "process_private"]]],
   ["GPU load", "%", [["GPU", "gpu"]], 100],
   ["CPU load", "%", [["Average of all cores", "cpu"], ["Busiest core", "cpu_max"]], 100],
   ["Input power", "W", [["VDD_IN", "power"]]],
@@ -845,8 +876,9 @@ const SECTIONS = [
   ["Training footprint", "These values can occur at different moments; do not add them together.", [
     "Peak GPU memory reserved", "Peak training state", "Saved for backward",
   ]],
-  ["Whole device", "A separate view of the device, including the OS and other programs.", [
-    "Whole-device RAM in use",
+  ["Training process", "Linux's own counters for the training process, so they do not " +
+    "depend on other programs or on which method ran first.", [
+    "Peak process RAM", "Process RAM after the step",
   ]],
 ];
 const BOX_NOTES = {
@@ -854,7 +886,7 @@ const BOX_NOTES = {
     "Training state (A) + other working memory (B). Unused cache is excluded.",
   "Training state at that moment": "A: model weights, optimizer data, weight gradients, " +
     "and saved activations and masks. This is part of the used total beside it.",
-  "Other working memory at that moment": "B: temporary buffers, inputs, a saved model copy " +
+  "Other working memory at that moment": "B: temporary buffers, inputs, a best-step copy " +
     "and other allocations. Added to A, this gives peak GPU memory used.",
   "GPU memory reserved at that moment": "Memory PyTorch holds from the GPU: used memory " +
     "(A + B), plus cache and allocation overhead (C). Some is available for reuse.",
@@ -864,9 +896,11 @@ const BOX_NOTES = {
     "training state only; running the step also needs working memory.",
   "Saved for backward": "Activations and masks kept after the forward pass to calculate " +
     "gradients. This is part of training state, not an extra amount to add to it.",
-  "Whole-device RAM in use": "Estimated RAM use after the training step finishes. " +
-    "Includes the OS and other programs, so it depends on what else is running. " +
-    "This is not a peak or a per-method cost; do not add it to the GPU figures.",
+  "Peak process RAM": "The most RAM the training process held at any moment (Linux " +
+    "VmHWM), including library code mapped from disk. When GPU buffers count toward it, " +
+    "they are already inside, so do not add the GPU figures to it.",
+  "Process RAM after the step": "What the training process held when the step " +
+    "finished (Linux VmRSS).",
 };
 const LABELS = {
   "Model state": "Model weights and buffers",
@@ -876,7 +910,7 @@ const LABELS = {
   "Saved ReLU bitmasks": "Saved activation masks",
   "Temporaries and workspace": "Temporary working buffers",
   "Input batch": "Input data",
-  "Best-checkpoint copy": "Saved model copy",
+  "Best-checkpoint copy": "Best-step copy",
   "Other allocations kept between steps": "Other allocations held before the step",
   "Allocator cache and rounding": "Cache and allocation overhead",
 };
@@ -889,7 +923,8 @@ const NOTES = {  // shown under each block and row of the table
     "or have already been released. Full FT does not use MemFLoRA's packed masks.",
   "Temporaries and workspace": "Short-lived buffers used while calculating outputs and gradients.",
   "Input batch": "The current batch of inputs and labels.",
-  "Best-checkpoint copy": "A second copy of the weights, kept to restore the best training step.",
+  "Best-checkpoint copy": "A copy of what training changes (trainable weights and " +
+    "buffers), kept to restore the best training step.",
   "Other allocations kept between steps": "Other memory already held before this step; " +
     "its exact owners have not been identified.",
   "Allocator cache and rounding": "Reserved memory beyond the live allocations: " +
@@ -976,9 +1011,13 @@ function renderTables(d, results, first) {
           card.append(node("div", `${MB(m.forward_saved_activations)} activations + ` +
             `${MB(m.forward_saved_bitmasks)} masks`, "note"));
         }
-        if (m && label === "Whole-device RAM in use") {
-          card.append(node("div", `Before the run: ${MB(m.device_ram_before)} · ` +
-            `Usable device RAM: ${MB(m.device_ram_total)}`, "note"));
+        if (m && label === "Peak process RAM" && m.gpu_in_rss != null) {
+          card.append(node("div", `GPU buffers counted: ${m.gpu_in_rss ? "yes" : "no"}`,
+            "note"));
+        }
+        if (m && label === "Process RAM after the step") {
+          card.append(node("div", `${MB(m.process_private)} private + ` +
+            `${MB(m.process_files)} library files`, "note"));
         }
       });
       card.append(node("div", BOX_NOTES[label], "note"));
@@ -1087,8 +1126,9 @@ function drawChart(title, unit, series, yMax) {
   }
   card.append(heading);
   if (title === CHARTS[0][0]) {
-    card.append(node("div", "Estimated RAM use for the whole device, including the OS and " +
-      "other programs. Sampled about twice per second; brief peaks may be missed.", "note"));
+    card.append(node("div", "Linux's counters for the process being measured, sampled " +
+      "about twice per second, so brief peaks may be missed. The gap separates the runs.",
+      "note"));
   }
   $("charts").append(card);
   const W = card.clientWidth - 28, H = 150, L = 46, R = 10, T = labelled ? 34 : 12, B = 22;

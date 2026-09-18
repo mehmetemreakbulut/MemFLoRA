@@ -186,7 +186,7 @@ The comparison table shows the sums at peak GPU use:
 
 - A: training state = weights/buffers + optimizer data + weight gradients + saved
   activations and masks.
-- B: other working memory = temporary buffers + inputs + saved model copy + other
+- B: other working memory = temporary buffers + inputs + best-step copy + other
   allocations held before the step.
 - **A + B = GPU memory used.**
 - C: cache and allocation overhead.
@@ -198,13 +198,24 @@ masks at the end of forward share one box. A zero mask row in the peak table can
 mean the peak occurred before masks were created or after they were released.
 Full fine-tuning does not use MemFLoRA's packed masks.
 
-**Whole-device RAM in use** replaces the process-memory counters. It estimates
-RAM use as Linux `MemTotal - MemAvailable`, including the OS and other programs.
-Linux describes these counters in its [memory documentation](https://docs.kernel.org/filesystems/proc.html#meminfo).
-The box shows the value after the step, with the starting value for context; the
-chart samples the whole run. This is not a per-method cost or a value to add to
-the GPU figures. Source hashes, software versions, and kernel backend status are
-included in the report's expandable build information.
+**Process RAM** comes from Linux's own counters for the training process
+(`VmHWM` for the peak and `VmRSS` after the step, from `/proc/<pid>/status`), so
+it does not depend on other programs or on which method ran first. Whether the
+process's GPU buffers count toward it depends on the JetPack kernel; the report
+says so for each run, checked with a 32 MiB probe allocation. When they count, the
+GPU figures are already inside, so never add the two. Source hashes, software
+versions, and kernel backend status are included in the report's expandable build
+information.
+
+Both methods run with two cheap runtime settings, unless you set these variables
+yourself: `CUBLAS_WORKSPACE_CONFIG=:16:8` gives each cuBLAS handle a 128 KiB
+workspace instead of about 8 MiB, and
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` lets the allocator grow and
+shrink its segments instead of keeping fragmented ones. The build information
+records both, and whether expandable segments were actually active.
+
+The memory optimizations made after the paper's code are listed in
+[OPTIMIZATIONS.md](OPTIMIZATIONS.md).
 
 `--trace-stacks --save-snapshot` records allocation stacks and saves PyTorch
 allocator snapshots for investigation; stack recording adds overhead.

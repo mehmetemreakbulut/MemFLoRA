@@ -67,6 +67,21 @@ class SGSession:
         self.optimizer.zero_grad(set_to_none=True)
 
 
+def changing_state(model, *optimizers):
+    """Copies of every tensor adaptation can change: optimized parameters, buffers.
+
+    Frozen weights never change, so the best-step checkpoint leaves them out rather
+    than copying the whole model. Restore it with load_state_dict(strict=False).
+    """
+    changing = {id(b) for b in model.buffers()}
+    changing |= {id(p) for o in optimizers for g in o.param_groups for p in g["params"]}
+    return {
+        name: tensor.detach().clone()
+        for name, tensor in model.state_dict(keep_vars=True).items()
+        if id(tensor) in changing
+    }
+
+
 def fit_steps_best(
     model,
     train_loader,
@@ -92,7 +107,8 @@ def fit_steps_best(
         eps=1e-8,
     )
     criterion = nn.CrossEntropyLoss()
-    best_state = deepcopy(model.state_dict())
+    optimizers = [optimizer, sg.optimizer] if sg else [optimizer]
+    best_state = changing_state(model, *optimizers)
     best_metrics = {"loss": math.inf, "accuracy": 0.0, "macro_f1": 0.0, "step": 0}
     iterator = iter(train_loader)
     time_spec = {
@@ -139,12 +155,13 @@ def fit_steps_best(
                     time_spec_reach_time_sec=elapsed,
                 )
             if metrics["loss"] < best_metrics["loss"] - 1e-8:
-                best_metrics, best_state = metrics, deepcopy(model.state_dict())
+                best_metrics = metrics
+                best_state = changing_state(model, *optimizers)
     if sg:
         best_metrics.update(sg.metrics())
     if time_spec_threshold_macro_f1 is not None:
         best_metrics.update(time_spec)
-    model.load_state_dict(best_state)
+    model.load_state_dict(best_state, strict=False)
     if sg:
         sg.close()
     return best_metrics
