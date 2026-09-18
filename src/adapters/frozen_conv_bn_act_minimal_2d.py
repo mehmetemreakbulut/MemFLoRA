@@ -17,7 +17,8 @@ from src.adapters._common import (
 from src.adapters._common import (
     _activation_mask_mode_code,
     _prepare_activation_mask,
-    _restore_activation_mask,
+    activation_grad,
+    scale_channels,
 )
 
 
@@ -82,25 +83,23 @@ class FrozenConvBNActMinimal2DFunction(Function):
         grad_bn_shift = None
         if ctx.needs_any_backward:
             base_weight, bn_scale, activation_mask = ctx.saved_tensors
-            if ctx.activation == 0:
-                grad_bn = grad_output
-            else:
-                mask = _restore_activation_mask(
-                    activation_mask,
-                    activation_mask_mode=ctx.activation_mask_mode,
-                    activation_mask_shape=ctx.activation_mask_shape,
-                )
-                grad_bn = grad_output * mask.to(dtype=grad_output.dtype)
+            g = activation_grad(
+                grad_output,
+                activation_mask,
+                ctx.activation,
+                ctx.activation_mask_mode,
+                ctx.activation_mask_shape,
+            )
             if ctx.needs_bn_shift_grad:
-                grad_bn_shift = grad_bn.sum(dim=(0, 2, 3))
-            grad_conv = grad_bn * bn_scale.view(1, -1, 1, 1)
+                grad_bn_shift = g.sum(dim=(0, 2, 3))
+            g = scale_channels(g, bn_scale, grad_output)  # now dL/d(conv output)
             if ctx.needs_base_bias_grad and ctx.has_base_bias:
-                grad_base_bias = grad_conv.sum(dim=(0, 2, 3))
+                grad_base_bias = g.sum(dim=(0, 2, 3))
             if ctx.needs_x_grad:
                 grad_x = nn_grad.conv2d_input(
                     ctx.input_shape,
                     base_weight,
-                    grad_conv,
+                    g,
                     stride=ctx.base.stride,
                     padding=ctx.base.padding,
                     dilation=ctx.base.dilation,

@@ -61,5 +61,6 @@ def unpack_bool_mask(packed: torch.Tensor, original_shape: torch.Size) -> torch.
         )
     values = flat_packed[:expected_bytes].view(-1, 1)
     weights = _bit_weights(packed.device).view(1, 8)
-    bits = torch.bitwise_and(values, weights).to(torch.bool).reshape(-1)[:numel]
-    return bits.reshape(tuple(original_shape))
+    # Turn the byte of bits into 0/1 in place and read it as bool: one allocation.
+    bits = torch.bitwise_and(values, weights).ne_(0).view(torch.bool)
+    return bits.reshape(-1)[:numel].reshape(tuple(original_shape))

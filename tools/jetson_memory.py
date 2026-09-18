@@ -3,18 +3,21 @@
     python tools/jetson_memory.py --model tresnet --rank 2
     python tools/jetson_memory.py --model mobilenetv2 --rank 2
 
-Each method runs in its own fresh process, so each pays for its own libraries.
-Inside PyTorch's allocator, the measured training step is recorded allocation by
-allocation, and every block alive at the step's peak is attributed to what owns
-it. Outside the allocator, each phase is charged the used RAM it added; CPU and GPU
-share that RAM on a Jetson. Keep the Jetson otherwise idle while measuring.
+Each method runs in its own fresh process, and every memory number comes from
+that process alone, so none depends on other processes or on which method ran
+first. Inside PyTorch's allocator, the measured training step is recorded
+allocation by allocation, and every block alive at the step's peak is attributed
+to what owns it. Outside the allocator, each phase is charged the private memory
+it added to the process; on a Jetson that includes GPU memory, since the GPU
+shares the RAM.
 
 The report is served at http://127.0.0.1:8000 and refreshes itself every second.
 Over SSH, open a tunnel first: ssh -L 8000:localhost:8000 <jetson>. Press Ctrl+C
 when done; a standalone copy is saved as report.html. Numbers are in MB (10^6 B).
 
 The step uses random weights and random windows of the Opportunity shape (97
-channels x 60 steps); its memory depends only on tensor shapes.
+channels x 60 steps); its memory depends only on tensor shapes. AdaBN calibration
+is skipped unless --use-adabn is given.
 """
 
 from __future__ import annotations
@@ -51,8 +54,8 @@ MODELS = {  # --model: display name, runner arguments
 # The paper's Opportunity settings.
 COMMON_ARGS = (
     "--dataset opportunity --window-size 60 --window-stride 30"
-    " --adabn-calibration-mode ema_no_reset --adabn-calib-batches 1"
-    " --bnpa-bottleneck-bn on --adabn-stat-source target --train_mode_adaBN off"
+    " --adabn-calibration-mode ema_no_reset --bnpa-bottleneck-bn on"
+    " --adabn-stat-source target --train_mode_adaBN off"
 )
 # Rows of the peak breakdown; the first block follows Table 3 of the paper.
 PEAK_BLOCKS = [
@@ -81,31 +84,29 @@ MARK = "@jetson_memory "  # marks the lines a measuring child sends back
 LOCK = threading.Lock()
 
 
-def meminfo() -> dict:
-    """Used RAM (MemTotal - MemAvailable) and, on a Jetson, GPU memory (NvMap)."""
-    with open("/proc/meminfo") as f:
-        info = {line.split(":")[0]: int(line.split()[1]) * 1024 for line in f}
-    used = info["MemTotal"] - info["MemAvailable"]
-    return {"used": used, "nvmap": info.get("NvMapMemUsed")}
-
-
-def resident() -> dict:
-    """This process's resident memory: private (anon) and mapped from files."""
-    with open("/proc/self/status") as f:
-        info = {
-            line.split(":")[0]: int(line.split()[1]) * 1024
-            for line in f
-            if line.startswith("Rss")
-        }
-    return {"anon": info["RssAnon"] + info["RssShmem"], "file": info["RssFile"]}
+def resident(pid="self") -> dict:
+    """A process's resident memory: private (anon and shmem) and mapped files."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            info = {
+                line.split(":")[0]: int(line.split()[1]) * 1024
+                for line in f
+                if line.startswith("Rss")
+            }
+    except OSError:  # the process has exited
+        return {}
+    if "RssAnon" not in info:  # exited, not yet reaped
+        return {}
+    return {"private": info["RssAnon"] + info["RssShmem"], "files": info["RssFile"]}
 
 
 class Monitor(threading.Thread):
-    """Samples used RAM, GPU memory, GPU and CPU load and power every 0.5 s."""
+    """Samples the measured process's memory, and GPU, CPU and power, every 0.5 s."""
 
     def __init__(self, samples: list) -> None:
         super().__init__(daemon=True)
         self.samples, self.process = samples, None
+        self.pid: int | None = None  # the process whose memory is sampled
 
     def run(self) -> None:
         if shutil.which("tegrastats"):
@@ -128,10 +129,10 @@ class Monitor(threading.Thread):
                 self.add({"cpu": sum(loads) / len(loads), "cpu_max": max(loads)})
 
     def add(self, sample: dict) -> None:
-        memory = meminfo()  # the counters the table uses, not tegrastats' RAM
-        sample["ram"] = round(memory["used"] / 1e6, 1)
-        if memory["nvmap"] is not None:
-            sample["gpu_mem"] = round(memory["nvmap"] / 1e6, 1)
+        memory = resident(self.pid) if self.pid else {}
+        if memory:
+            sample["private"] = round(memory["private"] / 1e6, 1)
+            sample["files"] = round(memory["files"] / 1e6, 1)
         with LOCK:
             self.samples.append({"t": time.time(), **sample})
 
@@ -158,54 +159,63 @@ def cpu_times() -> list[list[int]]:
         ]
 
 
-def replay(trace: list, before: dict, reserved: int) -> tuple[dict, int]:
-    """Replay a step's allocator trace up to its peak of requested bytes.
+def replay(trace: list, before: dict, reserved: int, kind) -> tuple:
+    """Replay a step's allocator trace.
 
-    `before` maps each block allocated when the trace began to its requested size.
-    Returns the blocks live at the peak, as address -> (index of the block's alloc
-    event, or -1 if it predates the trace; size), and the bytes reserved then.
+    `before` maps each block allocated when the trace began to its requested size,
+    and `kind(i)` is 1, 2 or 3 for the saved tensor, gradient or temporary that
+    event i allocates (0 is a block from before the step). Returns the requested
+    bytes of each kind and the reserved bytes after every event (the first entry
+    is the start), the entry of the peak, and the blocks live at the peak, as
+    address -> (index of the alloc event, or -1; size).
     """
 
     def run(events):
         live = {address: (-1, size) for address, size in before.items()}
-        held, total = reserved, sum(before.values())
-        peak, peak_at = total, 0
+        totals = [sum(before.values()), 0, 0, 0, reserved]
+        series = [totals.copy()]
         for i, event in enumerate(events):
             action, address = event["action"], event.get("addr")
             if action == "alloc":
                 live[address] = (i, event["size"])
-                total += event["size"]
+                totals[kind(i)] += event["size"]
             elif action in ("free_requested", "free_completed") and address in live:
-                total -= live.pop(address)[1]
+                index, size = live.pop(address)
+                totals[0 if index < 0 else kind(index)] -= size
             elif action in ("segment_alloc", "segment_map"):
-                held += event["size"]
+                totals[4] += event["size"]
             elif action in ("segment_free", "segment_unmap"):
-                held -= event["size"]
-            if total > peak:
-                peak, peak_at = total, i + 1
-        return live, held, peak_at
+                totals[4] -= event["size"]
+            series.append(totals.copy())
+        return live, series
 
-    live, held, _ = run(trace[: run(trace)[2]])
-    return live, held
+    series = run(trace)[1]
+    peak_at = max(range(len(series)), key=lambda k: sum(series[k][:4]))
+    return series, peak_at, run(trace[:peak_at])[0]
 
 
-def attribute(trace, before, reserved, forward_allocs, saved, grads, owners):
+def attribute(trace, before, reserved, phases, saved, grads, owners):
     """Attribute every block live at the step's peak to a row of the table.
 
-    `forward_allocs` is how many allocations the forward pass made, `saved` maps
-    the storage of each tensor autograd saved to its row, `grads` holds the
-    gradients' storages and `owners` maps tensors kept between steps to their row.
-    Returns the rows, the bytes reserved and requested at the peak, and the bytes
-    the forward pass saved.
+    `phases` holds how many allocations the step had made by the end of its
+    forward and its backward pass, `saved` maps the storage of each tensor
+    autograd saved to its row, `grads` holds the gradients' storages and `owners`
+    maps the tensors kept between steps to their row. Returns the rows, the bytes
+    reserved and requested at the peak, the bytes the forward pass saved, and the
+    step's timeline.
     """
-    live, held = replay(trace, before, reserved)
     allocs = [(i, e) for i, e in enumerate(trace) if e["action"] == "alloc"]
     # A saved tensor is the last block allocated at its address in the forward
     # pass; a gradient is the last block allocated at its address at all.
-    forward = {event["addr"]: i for i, event in allocs[:forward_allocs]}
+    forward = {event["addr"]: i for i, event in allocs[: phases[0]]}
     saved_at = {forward[a]: row for a, row in saved.items() if a in forward}
     last = {event["addr"]: i for i, event in allocs}
     grads_at = {last[a] for a in grads if a in last}
+
+    def kind(i):
+        return 1 if i in saved_at else 2 if i in grads_at else 3
+
+    series, peak_at, live = replay(trace, before, reserved, kind)
     rows = dict.fromkeys(owners.values(), 0)
     for address, (index, size) in live.items():
         if index < 0:
@@ -217,9 +227,20 @@ def attribute(trace, before, reserved, forward_allocs, saved, grads, owners):
         else:
             row = "Temporaries and workspace"
         rows[row] = rows.get(row, 0) + size
-    peak = sum(size for _, size in live.values())
+    peak, held = sum(series[peak_at][:4]), series[peak_at][4]
     rows["Allocator cache and rounding"] = held - peak
-    return rows, held, peak, sum(trace[i]["size"] for i in saved_at)
+    # About 300 points, each the highest of its stretch, so the peak survives.
+    stretch = max(1, len(series) // 300)
+    points = [
+        max(
+            ([k, *series[k]] for k in range(s, min(s + stretch, len(series)))),
+            key=lambda p: sum(p[1:5]),
+        )
+        for s in range(0, len(series), stretch)
+    ]
+    ends = [allocs[n - 1][0] + 1 if n else 0 for n in phases]  # where phases end
+    timeline = {"points": points, "ends": ends, "peak": peak_at, "events": len(trace)}
+    return rows, held, peak, sum(trace[i]["size"] for i in saved_at), timeline
 
 
 def emit(**message) -> None:
@@ -230,9 +251,10 @@ def measure(cli, method: str) -> None:
     """Measure one method. Runs in a child process and emits what it finds."""
     torch = None
     device = None
+    shared = False  # whether the GPU's buffers are part of this process's RAM
 
     def stage(name: str) -> dict:
-        row = {"name": name, "t": time.time(), **meminfo(), **resident()}
+        row = {"name": name, "t": time.time(), **resident()}
         if device is not None and device.type == "cuda":
             torch.cuda.synchronize()
             row["reserved"] = torch.cuda.memory_reserved()
@@ -240,8 +262,11 @@ def measure(cli, method: str) -> None:
         return row
 
     def outside(a: dict, b: dict) -> int:
-        """Used RAM a phase added, minus what PyTorch's allocator reserved in it."""
-        return b["used"] - a["used"] - b.get("reserved", 0) + a.get("reserved", 0)
+        """Private memory a phase added, minus what the allocator reserved in it."""
+        grown = b["private"] - a["private"]
+        if shared:
+            grown -= b.get("reserved", 0) - a.get("reserved", 0)
+        return grown
 
     s_start = stage("start")
     import torch
@@ -266,6 +291,7 @@ def measure(cli, method: str) -> None:
     else:
         device = torch.device("cuda")
         torch.zeros(1, device=device).add_(1).item()  # fails early on a wrong build
+        shared = bool(torch.cuda.get_device_properties(device).is_integrated)
     torch.manual_seed(1)
     s_context = stage("cuda context")
 
@@ -278,7 +304,7 @@ def measure(cli, method: str) -> None:
             "rank": cli.rank,
             "method": method,
             "batch_size": cli.batch,
-            "adabn_calib_batches": 1,
+            "adabn_calib_batches": 1 if cli.use_adabn else 0,
             "adapt_lr": 1e-3,
         }
     )
@@ -325,6 +351,9 @@ def measure(cli, method: str) -> None:
             saved[storage.data_ptr()] = (row, storage.nbytes())
         return tensor
 
+    def allocations() -> int:
+        return torch.cuda.memory_stats()["allocation.all.allocated"] if cuda else 0
+
     start_step()
     if cuda:
         torch.cuda.synchronize()
@@ -337,13 +366,12 @@ def measure(cli, method: str) -> None:
         }
         reserved = torch.cuda.memory_reserved()
         torch.cuda.reset_peak_memory_stats()
-        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    start = allocations()
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         loss = loss_fn(model(x), y)
-    if cuda:  # how many allocations the forward pass made
-        count = torch.cuda.memory_stats()["allocation.all.allocated"]
-        allocations = count - allocations
+    phases = [allocations() - start]
     loss.backward()
+    phases.append(allocations() - start)
     optimizer.step()
     s_done = stage("measured step")
 
@@ -358,7 +386,7 @@ def measure(cli, method: str) -> None:
     }
     for row, tensors in kept.items():
         for tensor in tensors:
-            if tensor.device == device and tensor.numel():
+            if tensor.device.type == device.type and tensor.numel():
                 storage = tensor.untyped_storage()
                 owners.setdefault(storage.data_ptr(), row)
                 sizes[storage.data_ptr()] = storage.nbytes()
@@ -371,8 +399,8 @@ def measure(cli, method: str) -> None:
         trace = traces[torch.cuda.current_device()]
         torch.cuda.memory._record_memory_history(None)
         kinds = {address: row for address, (row, _) in saved.items()}
-        found, held, peak, saved_total = attribute(
-            trace, before, reserved, allocations, kinds, grads, owners
+        found, held, peak, saved_total, timeline = attribute(
+            trace, before, reserved, phases, kinds, grads, owners
         )
         rows.update(found)
         verified = peak == torch.cuda.memory_stats()["requested_bytes.all.peak"]
@@ -388,7 +416,7 @@ def measure(cli, method: str) -> None:
         saved_total = rows["Saved activations"] + rows["Saved ReLU bitmasks"]
         unmeasured = {"Temporaries and workspace", "Allocator cache and rounding"}
         unmeasured.add("Other allocations kept between steps")
-        held = verified = None
+        held = verified = timeline = None
 
     groups = [
         [block, [[row, None if row in unmeasured else rows[row]] for row in names]]
@@ -396,9 +424,9 @@ def measure(cli, method: str) -> None:
     ]
     groups += [
         [
-            "Outside PyTorch's allocator: added used RAM",
+            "Outside PyTorch's allocator: this process",
             [
-                ["Python interpreter", s_start["used"] - cli.baseline["used"]],
+                ["Python interpreter", s_start["private"]],
                 ["PyTorch import", outside(s_start, s_torch)],
                 ["Project imports", outside(s_torch, s_project)],
                 ["CUDA context and driver", outside(s_project, s_context)],
@@ -407,31 +435,34 @@ def measure(cli, method: str) -> None:
             ],
         ],
         [
-            "Reclaimable, not counted above",
-            [["Library files mapped into the process", s_done["file"]]],
+            "Mapped library files, not counted above",
+            [["Library files mapped into the process", s_done["files"]]],
         ],
     ]
     for group in groups:  # each block carries its total
         group.insert(1, sum(value for _, value in group[1] if value is not None))
-    nvmap = [s_done["nvmap"], cli.baseline["nvmap"]]
     summary = [
         ["Training state at the peak", groups[0][1]],
         ["Saved activations, end of forward pass", saved_total],
         ["Optimizer state", rows["Optimizer state"]],
         ["PyTorch memory at the peak", held],
-        ["Whole run, added used RAM", s_done["used"] - cli.baseline["used"]],
-        ["GPU memory added (NvMap)", None if None in nvmap else nvmap[0] - nvmap[1]],
+        ["Process private memory, after the step", s_done["private"]],
+        ["Mapped library files", s_done["files"]],
     ]
-    emit(device=str(device), verified=verified, groups=groups, summary=summary)
-
-
-def run_child(label: str, method: str, report: dict) -> None:
-    """Measure one method in a fresh process, so it pays for its own libraries."""
-    baseline = json.dumps(meminfo())  # the RAM in use before the process starts
-    command = [sys.executable, __file__, *sys.argv[1:], "--child", method]
-    child = subprocess.Popen(
-        command + ["--baseline", baseline], stdout=subprocess.PIPE, text=True
+    emit(
+        device=str(device),
+        verified=verified,
+        groups=groups,
+        summary=summary,
+        timeline=timeline,
     )
+
+
+def run_child(label: str, method: str, report: dict, monitor: Monitor) -> None:
+    """Measure one method in a fresh process, so it pays for its own libraries."""
+    command = [sys.executable, __file__, *sys.argv[1:], "--child", method]
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    monitor.pid = child.pid  # the chart follows this process's memory
     assert child.stdout  # piped above
     for line in child.stdout:
         if not line.startswith(MARK):
@@ -445,7 +476,9 @@ def run_child(label: str, method: str, report: dict) -> None:
                 report["results"][label] = message
         if message.get("verified") is False:
             print(f"{label}: the allocator trace does not match PyTorch's peak")
-    if child.wait():
+    code = child.wait()
+    monitor.pid = None
+    if code:
         print(f"{label}: the measurement failed, see the error above")
 
 
@@ -475,11 +508,13 @@ def main() -> int:
     parser.add_argument("--model", type=str.lower, choices=MODELS, default="tresnet")
     parser.add_argument("--rank", type=int, default=2, help="MemFLoRA's rank")
     parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument(
+        "--use-adabn", action="store_true", help="calibrate BN on one batch first"
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--out", type=Path, help="default: runs/jetson_memory_*")
     parser.add_argument("--cpu", action="store_true", help="measure on the CPU")
     parser.add_argument("--child", help=argparse.SUPPRESS)  # the method to measure
-    parser.add_argument("--baseline", type=json.loads, help=argparse.SUPPRESS)
     cli = parser.parse_args()
     sys.stdout.reconfigure(line_buffering=True)
     if cli.child:
@@ -490,7 +525,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     report = {
         "title": f"{MODELS[cli.model][0]}: MemFLoRA (rank {cli.rank}) vs full"
-        f" fine-tuning, batch {cli.batch}",
+        f" fine-tuning, batch {cli.batch}, AdaBN {'on' if cli.use_adabn else 'off'}",
         "t0": time.time(),
         "runs": list(RUNS),
         "samples": [],
@@ -531,8 +566,8 @@ def main() -> int:
         print(f"over SSH, run this on your laptop first: {tunnel}")
 
     for label, method in RUNS.items():
-        time.sleep(3)  # idle, so each run starts from a settled baseline
-        run_child(label, method, report)
+        time.sleep(3)  # a short gap between the runs on the charts
+        run_child(label, method, report, monitor)
     with LOCK:
         report["done"] = True
     print()
@@ -560,10 +595,12 @@ PAGE = r"""<!doctype html>
 <style>
 :root { --bg: #f9f9f7; --card: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e;
   --mute: #898781; --grid: #e1e0d9; --axis: #c3c2b7; --line: rgba(11,11,11,.1);
-  --s1: #2a78d6; --s2: #eb6834; --warn: #b3261e; }
+  --s1: #2a78d6; --s2: #eb6834; --warn: #b3261e;
+  --k0: #b9b8b0; --k1: #7c5cc4; --k2: #2f9e6e; --k3: #d4a72c; }
 @media (prefers-color-scheme: dark) { :root { --bg: #0d0d0d; --card: #1a1a19;
   --ink: #fff; --ink2: #c3c2b7; --grid: #2c2c2a; --axis: #383835;
-  --line: rgba(255,255,255,.1); --s1: #3987e5; --s2: #d95926; --warn: #f2b8b5; } }
+  --line: rgba(255,255,255,.1); --s1: #3987e5; --s2: #d95926; --warn: #f2b8b5;
+  --k0: #57564f; --k1: #9b80e0; --k2: #3fb983; --k3: #e2b84a; } }
 body { margin: 0; background: var(--bg); color: var(--ink);
   font: 14px/1.45 system-ui, sans-serif; padding: 24px 16px; }
 main { max-width: 1000px; margin: auto; }
@@ -604,27 +641,32 @@ svg { display: block; width: 100%; }
     <ul>
       <li><b>PyTorch memory at the step's peak.</b> One training step runs with
         PyTorch's allocator history on. Replaying it finds the moment the most memory
-        was allocated, and every block alive then is attributed by its address: model
+        was requested, and every block alive then is attributed by its address: model
         state, optimizer state, gradients, the tensors autograd saved in this step's
         forward pass, temporaries allocated during the step, and blocks that existed
-        before it. Sizes are what each tensor requested; the allocator's cache and
-        rounding make up the rest of what it had reserved. The replayed peak is
-        checked against PyTorch's own peak counter.</li>
-      <li><b>Outside the allocator.</b> Each phase is charged the used RAM
-        (MemTotal − MemAvailable) it added, minus what the allocator reserved during
-        it: the interpreter, the libraries, the CUDA context, and the kernels and
-        handles cuDNN and cuBLAS load at first use. On a Jetson the CPU and GPU share
-        this RAM, so it includes GPU memory. The counter is system-wide, so the
-        Jetson should be otherwise idle.</li>
-      <li><b>Reclaimable memory.</b> Library files mapped into the process count
-        in its RSS (what <code>top</code> shows), but they sit in the page cache,
-        which the kernel can drop, so they are not in the totals.</li>
+        before it. The allocator's cache and rounding make up the rest of what it had
+        reserved. The replayed peak is checked against PyTorch's own peak
+        counter.</li>
+      <li><b>The step timelines.</b> The same replay over the whole step: what is
+        kept between steps, saved tensors, gradients and temporaries, stacked, with
+        the memory the allocator had reserved as a dashed line.</li>
+      <li><b>Process memory.</b> Everything else comes from the measured process's
+        own counters in <code>/proc/&lt;pid&gt;/status</code>: private memory
+        (RssAnon + RssShmem) and library files mapped from disk (RssFile). Neither
+        depends on other processes or on which method ran first. On a Jetson the GPU
+        shares the RAM, so PyTorch's GPU buffers are part of the private memory, and
+        each phase is charged what it added minus what the allocator reserved in it.
+        The first three blocks add up to about the process's private memory.</li>
+      <li><b>Mapped library files.</b> They count in RSS (what <code>top</code>
+        shows), but the kernel can drop these pages and read them again from disk,
+        so they are kept out of the totals.</li>
       <li><b>Grouping.</b> The first three tiles and the first block follow Table 3
         of the paper (peak training state, saved activations, optimizer state), but
         every number here is measured on the device.</li>
     </ul>
   </div>
   <div class="card" id="breakdown" hidden><table id="table"></table></div>
+  <div id="steps"></div>
   <div id="charts"></div>
   <div class="sub">Raw samples: <a href="data.json">data.json</a></div>
 </main>
@@ -635,20 +677,22 @@ const $ = (id) => document.getElementById(id);
 const MB = (b) => (b == null ? "n/a" : (b / 1e6).toFixed(2) + " MB");
 const NS = "http://www.w3.org/2000/svg";
 const CHARTS = [
-  ["Memory in use", "MB", [["Used RAM", "ram"], ["GPU memory (NvMap)", "gpu_mem"]]],
+  ["Memory of the measured process", "MB",
+    [["Private memory", "private"], ["Mapped library files", "files"]]],
   ["GPU load", "%", [["GPU", "gpu"]], 100],
   ["CPU load", "%", [["Average of all cores", "cpu"], ["Busiest core", "cpu_max"]], 100],
   ["Input power", "W", [["VDD_IN", "power"]]],
 ];
+const KINDS = ["Kept between steps", "Saved tensors", "Gradients", "Temporaries and workspace"];
 const NOTES = {  // shown under each block and row of the table
   "Training state at the step's peak":
     "What training itself holds at the moment of the step's peak.",
   "Other PyTorch memory at the peak":
     "The rest of what PyTorch's allocator had reserved at that moment.",
-  "Outside PyTorch's allocator: added used RAM":
-    "Used RAM each phase added, minus the allocator's own growth.",
-  "Reclaimable, not counted above":
-    "Resident, but the kernel can drop it when memory runs short.",
+  "Outside PyTorch's allocator: this process":
+    "Private memory each phase added to the process, minus the allocator's own growth.",
+  "Mapped library files, not counted above":
+    "Resident, but the kernel can drop these pages and read them again from disk.",
   "Model state": "Every weight and buffer: frozen backbone, adapters, BatchNorm statistics.",
   "Optimizer state": "Adam's two moment buffers for each trainable weight.",
   "Parameter gradients": "Gradients already computed when the peak happens.",
@@ -664,13 +708,13 @@ const NOTES = {  // shown under each block and row of the table
     "than the tensors above, mostly library workspaces such as cuBLAS's.",
   "Allocator cache and rounding": "Reserved from the driver but not requested by any " +
     "tensor at the peak: cached free blocks, and each block's rounding.",
-  "Python interpreter": "Python and this script's standard-library imports.",
+  "Python interpreter": "Private memory of Python and this script's imports at the start.",
   "PyTorch import": "Loading PyTorch and the CUDA libraries it links.",
   "Project imports": "This repository's modules, and torchvision for MobileNetV2.",
   "CUDA context and driver": "Created by the first GPU operation.",
   "Model and data setup": "Host memory used while building the model and the batch.",
   "cuDNN and cuBLAS at first use": "Kernels, library handles and caches, loaded from " +
-    "calibration up to the measured step.",
+    "the model's first use up to the end of the measured step.",
   "Library files mapped into the process": "Code of Python, PyTorch, CUDA and cuDNN " +
     "mapped from disk (RssFile).",
 };
@@ -682,9 +726,9 @@ function node(tag, text, cls) {
   if (cls) n.className = cls;
   return n;
 }
-function keyed(k, text, tag = "span", cls) {  // text behind the colour of run k
+function keyed(color, text, tag = "span", cls) {  // text behind a colour key
   const n = node(tag, null, cls), key = node("span", null, "key");
-  key.style.background = `var(--s${k + 1})`;
+  key.style.background = color;
   n.append(key, text);
   return n;
 }
@@ -693,6 +737,19 @@ function svgNode(parent, tag, attrs) {
   for (const k in attrs) n.setAttribute(k, attrs[k]);
   parent.append(n);
   return n;
+}
+function niceTop(high) {  // a round axis maximum and its step
+  const raw = high / 5, magnitude = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * magnitude).find((v) => v >= raw);
+  return [Math.ceil(high / step) * step, step];
+}
+function yAxis(svg, top, step, y, left, right) {
+  for (let v = 0; v <= top + 1e-9; v += step) {
+    svgNode(svg, "line", { x1: left, x2: right, y1: y(v), y2: y(v),
+      stroke: v ? "var(--grid)" : "var(--axis)" });
+    svgNode(svg, "text", { x: left - 6, y: y(v) + 4, "text-anchor": "end", class: "tick" })
+      .textContent = Math.round(v);
+  }
 }
 function stageAt(t) {  // a stage is logged when it ends, so it spans from the previous one
   const s = data.stages.find((row) => row.t >= t);
@@ -714,24 +771,29 @@ function render() {
     $("status").append(" · peaks checked against PyTorch's counter");
   }
   if (first) renderTables(d, results, first);
+  $("steps").replaceChildren();
+  drawSteps(d);
   $("charts").replaceChildren();
   for (const chart of CHARTS) drawChart(...chart);
 }
 
 function renderTables(d, results, first) {
   const cell = (r, value) => (r ? MB(value) : d.done ? "failed" : "…");
+  const color = (k) => `var(--s${k + 1})`;
   $("tiles").replaceChildren(...first.summary.map(([label], i) => {
     const card = node("div", null, "card");
     card.append(node("div", label, "label"));
     d.runs.forEach((run, k) => {
       const pair = node("div", null, "pair");
-      pair.append(keyed(k, run), node("span", cell(results[k], results[k]?.summary[i][1])));
+      pair.append(keyed(color(k), run),
+        node("span", cell(results[k], results[k]?.summary[i][1])));
       card.append(pair);
     });
     return card;
   }));
   const head = node("tr", null, "group");
-  head.append(node("td"), ...d.runs.map((run, k) => keyed(k, run, "td", "num")), node("td"));
+  head.append(node("td"), ...d.runs.map((run, k) => keyed(color(k), run, "td", "num")),
+    node("td"));
   const rows = [head];
   const named = (text, suffix) => {  // a name cell with its explanation underneath
     const n = node("td", text);
@@ -751,7 +813,7 @@ function renderTables(d, results, first) {
       values[i].forEach((value, k) => {
         const fill = node("div", null, "fill");
         fill.style.width = value > 0 ? `max(1px, ${(100 * value) / largest}%)` : "0";
-        fill.style.background = `var(--s${k + 1})`;
+        fill.style.background = color(k);
         bar.append(fill);
       });
       row.append(named(label),
@@ -763,6 +825,49 @@ function renderTables(d, results, first) {
   $("table").replaceChildren(...rows);
 }
 
+function drawSteps(d) {  // the allocator during each run's measured step, one scale
+  const runs = d.runs.filter((run) => d.results[run]?.timeline);
+  if (!runs.length) return;
+  const high = Math.max(...runs.flatMap((run) =>
+    d.results[run].timeline.points.map((p) => Math.max(p[5], p[1] + p[2] + p[3] + p[4]))));
+  const [top, step] = niceTop(Math.max(1, high / 1e6) * 1.05);
+  for (const run of runs) {
+    const { points, ends, peak, events } = d.results[run].timeline;
+    const card = node("div", null, "card");
+    const heading = node("h2", `${run}: PyTorch memory during the measured step (MB)`);
+    KINDS.forEach((name, i) => heading.append(keyed(`var(--k${i})`, name, "span", "label legend")));
+    heading.append(keyed("var(--ink2)", "Reserved", "span", "label legend"));
+    card.append(heading);
+    $("steps").append(card);
+    const W = card.clientWidth - 28, H = 170, L = 46, R = 10, T = 18, B = 8;
+    const svg = svgNode(card, "svg", { viewBox: `0 0 ${W} ${T + H + B}` });
+    const x = (k) => L + (k / Math.max(1, events)) * (W - L - R);
+    const y = (v) => T + H - (v / 1e6 / top) * H;
+    yAxis(svg, top, step, (v) => T + H - (v / top) * H, L, W - R);
+    let below = points.map(() => 0);
+    KINDS.forEach((_, i) => {
+      const above = points.map((p, j) => below[j] + p[i + 1]);
+      const edge = points.map((p, j) => `${x(p[0]).toFixed(1)},${y(above[j]).toFixed(1)}`);
+      const back = points.map((p, j) => `${x(p[0]).toFixed(1)},${y(below[j]).toFixed(1)}`).reverse();
+      svgNode(svg, "polygon", { points: [...edge, ...back].join(" "), fill: `var(--k${i})` });
+      below = above;
+    });
+    svgNode(svg, "polyline", { points: points.map((p) => `${x(p[0]).toFixed(1)},${y(p[5]).toFixed(1)}`).join(" "),
+      fill: "none", stroke: "var(--ink2)", "stroke-width": 1.5, "stroke-dasharray": "4 3" });
+    const bounds = [0, ...ends, events];
+    ["forward", "backward", "optimizer"].forEach((name, i) => {
+      if (i) svgNode(svg, "line", { x1: x(bounds[i]), x2: x(bounds[i]), y1: T, y2: T + H, stroke: "var(--axis)" });
+      if (x(bounds[i + 1]) - x(bounds[i]) > name.length * 6.5) {
+        svgNode(svg, "text", { x: (x(bounds[i]) + x(bounds[i + 1])) / 2, y: 12,
+          "text-anchor": "middle", class: "stage" }).textContent = name;
+      }
+    });
+    svgNode(svg, "line", { x1: x(peak), x2: x(peak), y1: T, y2: T + H,
+      stroke: "var(--ink)", "stroke-dasharray": "2 2" });
+    svgNode(svg, "text", { x: x(peak) + 4, y: T + 10, class: "run" }).textContent = "peak";
+  }
+}
+
 function drawChart(title, unit, series, yMax) {
   const d = data, samples = d.samples;
   series = series.filter(([, key]) => samples.some((s) => s[key] != null));
@@ -770,7 +875,8 @@ function drawChart(title, unit, series, yMax) {
   const labelled = title === CHARTS[0][0];  // run and stage names go on the first chart
   const card = node("div", null, "card"), heading = node("h2", `${title} (${unit})`);
   if (series.length > 1) {
-    series.forEach(([name], i) => heading.append(keyed(i, name, "span", "label legend")));
+    series.forEach(([name], i) =>
+      heading.append(keyed(`var(--s${i + 1})`, name, "span", "label legend")));
   }
   card.append(heading);
   $("charts").append(card);
@@ -782,18 +888,11 @@ function drawChart(title, unit, series, yMax) {
   const tEnd = Math.max(1, d.done ? Math.min(last, lastStage + 10) : last);
   const values = samples.filter((s) => s.t - d.t0 <= tEnd)
     .flatMap((s) => series.map(([, k]) => s[k])).filter((v) => v != null);
-  const high = yMax || Math.max(1, ...values) * 1.05;
-  const raw = high / 5, magnitude = 10 ** Math.floor(Math.log10(raw));
-  const step = [1, 2, 2.5, 5, 10].map((m) => m * magnitude).find((v) => v >= raw);
-  const top = yMax || Math.ceil(high / step) * step;
+  const [niceHigh, step] = niceTop(yMax || Math.max(1, ...values) * 1.05);
+  const top = yMax || niceHigh;
   const x = (t) => L + (t / tEnd) * (W - L - R);
   const y = (v) => T + H - (v / top) * H;
-  for (let v = 0; v <= top + 1e-9; v += step) {
-    svgNode(svg, "line", { x1: L, x2: W - R, y1: y(v), y2: y(v),
-      stroke: v ? "var(--grid)" : "var(--axis)" });
-    svgNode(svg, "text", { x: L - 6, y: y(v) + 4, "text-anchor": "end", class: "tick" })
-      .textContent = Math.round(v);
-  }
+  yAxis(svg, top, yMax ? yMax / 5 : step, y, L, W - R);
   for (let i = 0; i <= 5; i++) {
     svgNode(svg, "text", { x: x((tEnd * i) / 5), y: T + H + 16,
       "text-anchor": i === 5 ? "end" : "middle", class: "tick" })
@@ -810,11 +909,15 @@ function drawChart(title, unit, series, yMax) {
     }
     previous = sx;
   }
-  series.forEach(([, key], i) => {
-    const points = samples.filter((s) => s[key] != null && s.t - d.t0 <= tEnd)
-      .map((s) => `${x(s.t - d.t0).toFixed(1)},${y(s[key]).toFixed(1)}`);
-    svgNode(svg, "polyline", { points: points.join(" "), fill: "none",
-      stroke: `var(--s${i + 1})`, "stroke-width": 2, "stroke-linejoin": "round" });
+  series.forEach(([, key], i) => {  // the line breaks where there is no sample
+    let path = "", pen = "M";
+    for (const s of samples.filter((s) => s.t - d.t0 <= tEnd)) {
+      if (s[key] == null) { pen = "M"; continue; }
+      path += `${pen}${x(s.t - d.t0).toFixed(1)},${y(s[key]).toFixed(1)} `;
+      pen = "L";
+    }
+    svgNode(svg, "path", { d: path, fill: "none", stroke: `var(--s${i + 1})`,
+      "stroke-width": 2, "stroke-linejoin": "round" });
   });
   const cross = svgNode(svg, "line", { y1: T, y2: T + H, stroke: "var(--mute)", visibility: "hidden" });
   const show = (t, event) => {

@@ -120,7 +120,7 @@ class BitpackedReLUFunction(Function):
     def backward(ctx, grad_output: torch.Tensor):
         (packed,) = ctx.saved_tensors
         mask = unpack_bool_mask(packed, torch.Size(ctx.mask_shape))
-        return grad_output * mask.to(dtype=grad_output.dtype)
+        return torch.where(mask, grad_output, 0)
 
 
 class TResNetResidualReLUBitpack2D(nn.Module):

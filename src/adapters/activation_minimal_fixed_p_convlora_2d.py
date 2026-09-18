@@ -11,13 +11,15 @@ from torch.autograd import Function
 from torch.nn import grad as nn_grad
 
 from src.utils.adabn import batch_norm_train_output_from_preactivation
-from src.utils.bitpack import pack_bool_mask, unpack_bool_mask
+from src.utils.bitpack import pack_bool_mask
 from src.adapters._common import (
     ConvSpec,
+    activation_grad,
     conv_spec,
     make_projection_conv,
     AdapterBlockCommon,
     ProjectionAdapterCommon,
+    scale_channels,
     stash_fused_geometry,
     _activation_code,
     _needs_grouped_projection,
@@ -113,46 +115,35 @@ class ActivationMinimalFixedPConvBNAct2DFunction(Function):
         else:
             bn_scale, activation_mask = saved_tensors[1:]
             base_weight = p_weight = u_weight = None
-        if ctx.activation == 0:
-            grad_bn = grad_output
-        else:
-            mask = unpack_bool_mask(
-                activation_mask, torch.Size(ctx.activation_mask_shape)
-            )
-            grad_bn = grad_output * mask.to(dtype=grad_output.dtype)
-        grad_q = grad_bn * bn_scale.view(1, -1, 1, 1)
-        grad_adapter_output = grad_q * ctx.scale
+        g = activation_grad(
+            grad_output, activation_mask, ctx.activation, 1, ctx.activation_mask_shape
+        )
+        # dL/dq; the adapter output's gradient is this times scale, which is
+        # applied to the small results instead of a full-width copy.
+        grad_q = scale_channels(g, bn_scale, grad_output)
+        del g
         grad_u_weight = nn_grad.conv2d_weight(
             z,
             ctx.u_weight_shape,
-            grad_adapter_output,
+            grad_q,
             stride=ctx.u.stride,
             padding=ctx.u.padding,
             dilation=ctx.u.dilation,
             groups=ctx.u.groups,
-        )
-        grad_u_bias = grad_adapter_output.sum(dim=(0, 2, 3)) if ctx.has_u_bias else None
+        ).mul_(ctx.scale)
+        grad_u_bias = grad_q.sum(dim=(0, 2, 3)).mul_(ctx.scale) if ctx.has_u_bias else None
         grad_x = None
         if ctx.needs_x_grad:
             grad_z = nn_grad.conv2d_input(
                 ctx.z_shape,
                 u_weight,
-                grad_adapter_output,
+                grad_q,
                 stride=ctx.u.stride,
                 padding=ctx.u.padding,
                 dilation=ctx.u.dilation,
                 groups=ctx.u.groups,
-            )
-            grad_x_adapter = nn_grad.conv2d_input(
-                ctx.input_shape,
-                p_weight,
-                grad_z,
-                stride=ctx.p.stride,
-                padding=ctx.p.padding,
-                dilation=ctx.p.dilation,
-                groups=ctx.p.groups,
-            )
-            grad_x_base = nn_grad.conv2d_input(
+            ).mul_(ctx.scale)
+            grad_x = nn_grad.conv2d_input(
                 ctx.input_shape,
                 base_weight,
                 grad_q,
@@ -161,7 +152,16 @@ class ActivationMinimalFixedPConvBNAct2DFunction(Function):
                 dilation=ctx.base.dilation,
                 groups=ctx.base.groups,
             )
-            grad_x = grad_x_base + grad_x_adapter
+            del grad_q
+            grad_x += nn_grad.conv2d_input(
+                ctx.input_shape,
+                p_weight,
+                grad_z,
+                stride=ctx.p.stride,
+                padding=ctx.p.padding,
+                dilation=ctx.p.dilation,
+                groups=ctx.p.groups,
+            )
         return (
             grad_x,
             None,

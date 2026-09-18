@@ -11,9 +11,10 @@ from torch.autograd import Function
 from torch.nn import grad as nn_grad
 
 from src.utils.adabn import batch_norm_train_output_from_preactivation
-from src.utils.bitpack import unpack_bool_mask
 from src.adapters._common import (
+    activation_grad,
     fused_activation_inplace,
+    scale_channels,
     stash_fused_geometry,
     ConvSpec,
     conv_spec,
@@ -204,26 +205,16 @@ class BNPAConvBNAct2DFunction(Function):
                 activation_mask,
             ) = saved_tensors
             base_weight = p_weight = None
-        if ctx.activation == 0:
-            g = grad_output
-        else:
-            mask = unpack_bool_mask(
-                activation_mask, torch.Size(ctx.activation_mask_shape)
-            )
-            g = grad_output * mask.to(dtype=grad_output.dtype)
-        bn_scale_view = bn_scale.view(1, -1, 1, 1) if bn_scale is not None else None
-        if ctx.adapter_pre_bn:
-            adapter_output_scale_view = bn_scale_view
-        elif ctx.post_bn_adapter_scale_by_source_bn:
-            adapter_output_scale_view = bn_scale_view
-        else:
-            adapter_output_scale_view = None
-        grad_adapter_out = (
-            g * adapter_output_scale_view * ctx.scale
-            if adapter_output_scale_view is not None
-            else g * ctx.scale
+        g = activation_grad(
+            grad_output, activation_mask, ctx.activation, 1, ctx.activation_mask_shape
         )
-        grad_u_adapter_out = grad_adapter_out
+        grad_bn_shift = g.sum(dim=(0, 2, 3))
+        # The adapter output's gradient is g * scale, times the source BN scale when
+        # the adapter is scaled by it. `scale` is applied to the small results, so
+        # no full-width copy of it is made.
+        adapter_scaled = ctx.adapter_pre_bn or ctx.post_bn_adapter_scale_by_source_bn
+        if adapter_scaled:
+            g = scale_channels(g, bn_scale, grad_output)  # also dL/dz of the base conv
         if ctx.bottleneck_bn_enabled:
             q_tilde, grad_q, grad_bn_weight, grad_bn_bias = _bottleneck_bn_backward(
                 q=q,
@@ -232,7 +223,8 @@ class BNPAConvBNAct2DFunction(Function):
                 bottleneck_weight=bottleneck_weight,
                 bottleneck_bias=bottleneck_bias,
                 u_weight=u_weight,
-                grad_adapter_out=grad_adapter_out,
+                grad_adapter_out=g,
+                scale=ctx.scale,
                 u_stride=ctx.u.stride,
                 u_padding=ctx.u.padding,
                 u_dilation=ctx.u.dilation,
@@ -244,12 +236,12 @@ class BNPAConvBNAct2DFunction(Function):
             grad_q = nn_grad.conv2d_input(
                 tuple(q.shape),
                 u_weight,
-                grad_adapter_out,
+                g,
                 stride=ctx.u.stride,
                 padding=ctx.u.padding,
                 dilation=ctx.u.dilation,
                 groups=ctx.u.groups,
-            )
+            ).mul_(ctx.scale)
             grad_bn_weight = None
             grad_bn_bias = None
         g_capture_callback = getattr(ctx, "g_capture_callback", None)
@@ -258,26 +250,28 @@ class BNPAConvBNAct2DFunction(Function):
         grad_u_weight = nn_grad.conv2d_weight(
             q_tilde.detach(),
             ctx.u_weight_shape,
-            grad_u_adapter_out,
+            g,
             stride=ctx.u.stride,
             padding=ctx.u.padding,
             dilation=ctx.u.dilation,
             groups=ctx.u.groups,
-        )
-        grad_u_bias = grad_u_adapter_out.sum(dim=(0, 2, 3)) if ctx.has_u_bias else None
+        ).mul_(ctx.scale)
+        grad_u_bias = g.sum(dim=(0, 2, 3)).mul_(ctx.scale) if ctx.has_u_bias else None
         grad_x = None
         if ctx.needs_x_grad:
-            grad_z = g * bn_scale_view
-            grad_x_base = nn_grad.conv2d_input(
+            if not adapter_scaled:
+                g = scale_channels(g, bn_scale, grad_output)
+            grad_x = nn_grad.conv2d_input(
                 ctx.input_shape,
                 base_weight,
-                grad_z,
+                g,
                 stride=ctx.base.stride,
                 padding=ctx.base.padding,
                 dilation=ctx.base.dilation,
                 groups=ctx.base.groups,
             )
-            grad_x_adapter = nn_grad.conv2d_input(
+            del g
+            grad_x += nn_grad.conv2d_input(
                 ctx.input_shape,
                 p_weight,
                 grad_q,
@@ -286,8 +280,6 @@ class BNPAConvBNAct2DFunction(Function):
                 dilation=ctx.p.dilation,
                 groups=ctx.p.groups,
             )
-            grad_x = grad_x_base + grad_x_adapter
-        grad_bn_shift = g.sum(dim=(0, 2, 3))
         return (
             grad_x,
             None,
@@ -398,38 +390,36 @@ class BNPAConvBNAct2DPostBNScaledOptimizedFunction(Function):
         else:
             q, u_weight, bn_scale, activation_mask = ctx.saved_tensors
             base_weight = p_weight = None
-        if ctx.activation == 0:
-            g = grad_output
-        else:
-            mask = unpack_bool_mask(
-                activation_mask, torch.Size(ctx.activation_mask_shape)
-            )
-            g = grad_output * mask.to(dtype=grad_output.dtype)
-        bn_scale_view = bn_scale.view(1, -1, 1, 1)
-        grad_adapter_out = g * bn_scale_view * ctx.scale
+        g = activation_grad(
+            grad_output, activation_mask, ctx.activation, 1, ctx.activation_mask_shape
+        )
+        grad_bn_shift = g.sum(dim=(0, 2, 3))
+        # dL/dz of the base conv; the adapter output's gradient is this times scale,
+        # which is applied to the small results instead of a full-width copy.
+        grad_z = scale_channels(g, bn_scale, grad_output)
+        del g
         grad_q = nn_grad.conv2d_input(
             tuple(q.shape),
             u_weight,
-            grad_adapter_out,
+            grad_z,
             stride=ctx.u.stride,
             padding=ctx.u.padding,
             dilation=ctx.u.dilation,
             groups=1,
-        )
+        ).mul_(ctx.scale)
         grad_u_weight = nn_grad.conv2d_weight(
             q.detach(),
             ctx.u_weight_shape,
-            grad_adapter_out,
+            grad_z,
             stride=ctx.u.stride,
             padding=ctx.u.padding,
             dilation=ctx.u.dilation,
             groups=1,
-        )
-        grad_u_bias = grad_adapter_out.sum(dim=(0, 2, 3)) if ctx.has_u_bias else None
+        ).mul_(ctx.scale)
+        grad_u_bias = grad_z.sum(dim=(0, 2, 3)).mul_(ctx.scale) if ctx.has_u_bias else None
         grad_x = None
         if ctx.needs_x_grad:
-            grad_z = g * bn_scale_view
-            grad_x_base = nn_grad.conv2d_input(
+            grad_x = nn_grad.conv2d_input(
                 ctx.input_shape,
                 base_weight,
                 grad_z,
@@ -438,7 +428,8 @@ class BNPAConvBNAct2DPostBNScaledOptimizedFunction(Function):
                 dilation=ctx.base.dilation,
                 groups=1,
             )
-            grad_x_adapter = nn_grad.conv2d_input(
+            del grad_z
+            grad_x += nn_grad.conv2d_input(
                 ctx.input_shape,
                 p_weight,
                 grad_q,
@@ -447,8 +438,6 @@ class BNPAConvBNAct2DPostBNScaledOptimizedFunction(Function):
                 dilation=ctx.p.dilation,
                 groups=1,
             )
-            grad_x = grad_x_base + grad_x_adapter
-        grad_bn_shift = g.sum(dim=(0, 2, 3))
         return (
             grad_x,
             None,
@@ -757,12 +746,15 @@ def _bottleneck_bn_backward(
     bottleneck_bias: torch.Tensor,
     u_weight: torch.Tensor,
     grad_adapter_out: torch.Tensor,
+    scale: float,
     u_stride: Tuple[int, int],
     u_padding: Tuple[int, int],
     u_dilation: Tuple[int, int],
     u_groups: int,
     training: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward of the bottleneck BN; the adapter's gradient is `grad_adapter_out`
+    times `scale`, applied here to the rank-r result."""
     reduce_dims = _channel_reduce_dims(q)
     q_hat = (q - _channel_view(q_mean, q)) * _channel_view(q_invstd, q)
     q_tilde = q_hat * _channel_view(bottleneck_weight, q) + _channel_view(
@@ -776,7 +768,7 @@ def _bottleneck_bn_backward(
         padding=u_padding,
         dilation=u_dilation,
         groups=u_groups,
-    )
+    ).mul_(scale)
     grad_gamma = (grad_q_tilde * q_hat).sum(dim=reduce_dims)
     grad_beta = grad_q_tilde.sum(dim=reduce_dims)
     grad_qhat = grad_q_tilde * _channel_view(bottleneck_weight, q)

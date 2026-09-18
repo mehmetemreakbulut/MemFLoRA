@@ -75,34 +75,30 @@ class _LoRAEdgeOptimizedConv2dFunction(Function):
         groups = int(ctx.groups)
         _out_channels, rank = ctx.g1_shape
         out_channels_per_group = int(ctx.g1_shape[0] // groups)
-        scaled_grad_output = grad_output * ctx.scale
-        scaled_grad_view = scaled_grad_output.view(
+        # The adapter's gradient is grad_output * scale; the scale is applied to the
+        # small results, and intermediates are freed as soon as they are used.
+        grad_view = grad_output.reshape(
             batch_size, groups, out_channels_per_group, out_height, out_width
         )
         suffix_projection_view = suffix_projection.view(
             batch_size, groups, rank, out_height, out_width
         )
-        grad_g1 = torch.einsum(
-            "bgohw,bgqhw->goq", scaled_grad_view, suffix_projection_view
-        ).reshape(ctx.g1_shape)
+        grad_g1 = (
+            torch.einsum("bgohw,bgqhw->goq", grad_view, suffix_projection_view)
+            .reshape(ctx.g1_shape)
+            .mul_(ctx.scale)
+        )
         grad_x = None
         if ctx.needs_x_grad:
             base_weight, tt_suffix, g1 = saved_tensors[1:]
             g1_view = g1.view(groups, out_channels_per_group, rank)
-            grad_t = torch.einsum(
-                "bgohw,goq->bgqhw", scaled_grad_view, g1_view
-            ).reshape(ctx.suffix_projection_shape)
-            tt_suffix_grouped = tt_suffix.repeat(groups, 1, 1, 1)
-            grad_x_adapter = nn_grad.conv2d_input(
-                ctx.input_shape,
-                tt_suffix_grouped,
-                grad_t,
-                stride=ctx.stride,
-                padding=ctx.padding,
-                dilation=ctx.dilation,
-                groups=groups,
+            grad_t = (
+                torch.einsum("bgohw,goq->bgqhw", grad_view, g1_view)
+                .reshape(ctx.suffix_projection_shape)
+                .mul_(ctx.scale)
             )
-            grad_x_base = nn_grad.conv2d_input(
+            del grad_view
+            grad_x = nn_grad.conv2d_input(
                 ctx.input_shape,
                 base_weight,
                 grad_output,
@@ -111,7 +107,15 @@ class _LoRAEdgeOptimizedConv2dFunction(Function):
                 dilation=ctx.dilation,
                 groups=groups,
             )
-            grad_x = grad_x_base + grad_x_adapter
+            grad_x += nn_grad.conv2d_input(
+                ctx.input_shape,
+                tt_suffix.repeat(groups, 1, 1, 1),
+                grad_t,
+                stride=ctx.stride,
+                padding=ctx.padding,
+                dilation=ctx.dilation,
+                groups=groups,
+            )
         return (grad_x, None, None, None, grad_g1, None, None)
 
 

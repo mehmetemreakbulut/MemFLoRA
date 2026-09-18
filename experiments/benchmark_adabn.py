@@ -44,6 +44,7 @@ def calibrate_minimal_adabn_if_needed(
             device=device,
             calibration_mode=args.adabn_calibration_mode,
         )
+        release_cached_memory(device)
         return
 
     model.eval()
@@ -64,6 +65,16 @@ def calibrate_minimal_adabn_if_needed(
         model.train()
         freeze_bn_eval(model)
     assert_batch_norm_eval_frozen_finite(model)
+    release_cached_memory(device)
+
+
+def release_cached_memory(device: torch.device) -> None:
+    """Return the blocks the calibration pass left in PyTorch's cache to the device.
+
+    Training never reuses most of them, and the allocator would keep them reserved.
+    """
+    if torch.device(device).type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def set_eval_adabn_stat_collection(model: nn.Module, enabled: bool) -> None:

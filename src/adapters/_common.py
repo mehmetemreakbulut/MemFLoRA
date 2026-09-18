@@ -78,10 +78,43 @@ def _restore_activation_mask(
     activation_mask_shape: Tuple[int, ...],
 ) -> torch.Tensor:
     if activation_mask_mode == 0:
-        return activation_mask.to(torch.bool)
+        return activation_mask.view(torch.bool)  # stored as 0/1 bytes, no copy
     if activation_mask_mode == 1:
         return unpack_bool_mask(activation_mask, torch.Size(activation_mask_shape))
     raise ValueError(f"Unknown activation mask mode code: {activation_mask_mode}")
+
+
+# The hand-written backward passes free each full-width intermediate, or overwrite
+# it in place, as soon as the next operation has used it, as PyTorch's do.
+def activation_grad(
+    grad_output: torch.Tensor,
+    activation_mask: torch.Tensor,
+    activation: int,
+    activation_mask_mode: int,
+    activation_mask_shape: Tuple[int, ...],
+) -> torch.Tensor:
+    """The gradient before the activation: `grad_output` where it passed, else 0.
+
+    Without an activation this is `grad_output` itself; otherwise it is a new
+    tensor the caller owns and may overwrite. The unpacked mask is freed on return.
+    """
+    if activation == 0:
+        return grad_output
+    mask = _restore_activation_mask(
+        activation_mask, activation_mask_mode, activation_mask_shape
+    )
+    return torch.where(mask, grad_output, 0)
+
+
+def scale_channels(
+    grad: torch.Tensor, scale: torch.Tensor, grad_output: torch.Tensor
+) -> torch.Tensor:
+    """`grad` times a per-channel scale, in place unless it is `grad_output`.
+
+    Autograd may share `grad_output` with other nodes, so it is never overwritten.
+    """
+    view = _channel_view(scale, grad)
+    return grad * view if grad is grad_output else grad.mul_(view)
 
 
 def stash_fused_geometry(
