@@ -177,14 +177,34 @@ Jetson together with the profiler.
 For the main benchmark, select the same behavior with the environment variable
 `MEMFLORA_BITPACK_BACKEND=cuda`, `auto`, or `torch`.
 
-The report separates maximum requested CUDA memory, maximum reserved memory,
-maximum training state, and saved state at the end of forward. Its category table
-is a snapshot at the overall requested peak: a zero mask row can mean the peak
-occurred before masks were created or after they were released. Full fine-tuning
-does not use MemFLoRA's packed masks. Linux RSS, private pages, and PSS are separate
-views and must not be added to CUDA memory or used to infer library overhead by
-subtracting CUDA bytes. Source hashes, software versions, and kernel backend
-status are included in the report.
+The report groups values from the same moment together. **GPU memory used** means
+the bytes occupied by live PyTorch allocations (the allocator's requested-byte
+counter). **GPU memory reserved** also includes cache and allocation overhead.
+Both cover PyTorch-managed GPU memory, not the whole program or device.
+
+The comparison table shows the sums at peak GPU use:
+
+- A: training state = weights/buffers + optimizer data + weight gradients + saved
+  activations and masks.
+- B: other working memory = temporary buffers + inputs + saved model copy + other
+  allocations held before the step.
+- **A + B = GPU memory used.**
+- C: cache and allocation overhead.
+- **A + B + C = GPU memory reserved at that same moment.**
+
+The largest reserved memory and largest training state during the whole step are
+shown separately; they can occur at different moments. Saved activations and
+masks at the end of forward share one box. A zero mask row in the peak table can
+mean the peak occurred before masks were created or after they were released.
+Full fine-tuning does not use MemFLoRA's packed masks.
+
+**Whole-device RAM in use** replaces the process-memory counters. It estimates
+RAM use as Linux `MemTotal - MemAvailable`, including the OS and other programs.
+Linux describes these counters in its [memory documentation](https://docs.kernel.org/filesystems/proc.html#meminfo).
+The box shows the value after the step, with the starting value for context; the
+chart samples the whole run. This is not a per-method cost or a value to add to
+the GPU figures. Source hashes, software versions, and kernel backend status are
+included in the report's expandable build information.
 
 `--trace-stacks --save-snapshot` records allocation stacks and saves PyTorch
 allocator snapshots for investigation; stack recording adds overhead.

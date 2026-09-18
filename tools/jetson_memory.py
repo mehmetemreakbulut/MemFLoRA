@@ -5,9 +5,10 @@
 
 Each method runs in a fresh process. The CUDA allocator trace reports requested
 and reserved peaks separately, plus the training-state maximum and the category
-breakdown at the overall requested peak. Process RSS/PSS are independent views;
-they are never added to, or reduced by, CUDA bytes. GPU inclusion in Linux RSS
-depends on the JetPack/kernel, not just whether the GPU uses shared RAM.
+breakdown at the overall requested peak. The report calls requested bytes memory
+"used" and shows reserved memory separately. Whole-device RAM is estimated from
+Linux MemTotal - MemAvailable and includes the OS and other programs; it is never
+added to the CUDA totals.
 
 The report is served at http://127.0.0.1:8000 and refreshes itself every second.
 Over SSH, open a tunnel first: ssh -L 8000:localhost:8000 <jetson>. Press Ctrl+C
@@ -61,7 +62,7 @@ COMMON_ARGS = (
 # Category snapshots at the overall requested-byte peak, not separate maxima.
 PEAK_BLOCKS = [
     [
-        "Training state at the step's peak",
+        "A. Training state",
         [
             "Model state",
             "Optimizer state",
@@ -71,64 +72,47 @@ PEAK_BLOCKS = [
         ],
     ],
     [
-        "Other PyTorch memory at the peak",
+        "B. Other working memory",
         [
             "Temporaries and workspace",
             "Input batch",
             "Best-checkpoint copy",
             "Other allocations kept between steps",
-            "Allocator cache and rounding",
         ],
     ],
+    ["C. Cache and allocation overhead", ["Allocator cache and rounding"]],
 ]
 MARK = "@jetson_memory "  # marks the lines a measuring child sends back
 LOCK = threading.Lock()
 
 
-def resident(pid="self", detailed=False) -> dict:
-    """Linux process counters; no assumptions about CUDA/RSS overlap."""
+def device_memory() -> dict:
+    """Estimated whole-device RAM use, not memory attributable to this process.
+
+    MemAvailable accounts for memory Linux can reclaim for new applications:
+    https://docs.kernel.org/filesystems/proc.html#meminfo
+    """
     try:
-        with open(f"/proc/{pid}/status") as f:
+        with open("/proc/meminfo") as f:
             info = {
                 line.split(":")[0]: int(line.split()[1]) * 1024
                 for line in f
-                if line.startswith("Rss")
+                if line.startswith(("MemTotal:", "MemAvailable:"))
             }
-    except OSError:  # the process has exited
-        return {}
-    if "RssAnon" not in info:  # exited, not yet reaped
-        return {}
-    result = {
-        "anon": info["RssAnon"],
-        "shmem": info["RssShmem"],
-        "files": info["RssFile"],
-        "rss": sum(info[key] for key in ("RssAnon", "RssShmem", "RssFile")),
-    }
-    if detailed:
-        try:
-            with open(f"/proc/{pid}/smaps_rollup") as f:
-                smaps = {
-                    line.split(":")[0]: int(line.split()[1]) * 1024
-                    for line in f
-                    if line.startswith(("Private_", "Pss:"))
-                }
-            result["private"] = sum(
-                smaps.get(key, 0)
-                for key in ("Private_Clean", "Private_Dirty", "Private_Hugetlb")
-            )
-            result["pss"] = smaps.get("Pss")
-        except OSError:
-            result.update(private=None, pss=None)
-    return result
+        return {
+            "device_ram_used": info["MemTotal"] - info["MemAvailable"],
+            "device_ram_total": info["MemTotal"],
+        }
+    except (OSError, KeyError, ValueError):
+        return {"device_ram_used": None, "device_ram_total": None}
 
 
 class Monitor(threading.Thread):
-    """Samples the measured process's memory, and GPU, CPU and power, every 0.5 s."""
+    """Samples whole-device RAM, GPU, CPU and power every 0.5 s."""
 
     def __init__(self, samples: list) -> None:
         super().__init__(daemon=True)
         self.samples, self.process = samples, None
-        self.pid: int | None = None  # the process whose memory is sampled
 
     def run(self) -> None:
         if shutil.which("tegrastats"):
@@ -151,10 +135,8 @@ class Monitor(threading.Thread):
                 self.add({"cpu": sum(loads) / len(loads), "cpu_max": max(loads)})
 
     def add(self, sample: dict) -> None:
-        memory = resident(self.pid) if self.pid else {}
-        if memory:
-            sample["rss"] = round(memory["rss"] / 1e6, 1)
-            sample["files"] = round(memory["files"] / 1e6, 1)
+        used = device_memory()["device_ram_used"]
+        sample["device_ram"] = used / 1e6 if used is not None else None
         with LOCK:
             self.samples.append({"t": time.time(), **sample})
 
@@ -360,7 +342,7 @@ def provenance(cli, method, torch, device):
         "empty_cache_after_calibration": cli.empty_cache_after_calibration,
         "trace_stacks": cli.trace_stacks,
         "synthetic_inputs": True,
-        "cuda_rss_overlap": "unknown; counters are not combined",
+        "device_ram_measure": "MemTotal - MemAvailable; whole device, includes other programs",
     }
 
 
@@ -372,13 +354,13 @@ def measure(cli, method: str) -> None:
     def stage(name: str) -> dict:
         if device is not None and device.type == "cuda":
             torch.cuda.synchronize()
-        row = {"name": name, "t": time.time(), **resident(detailed=True)}
+        row = {"name": name, "t": time.time(), **device_memory()}
         if device is not None and device.type == "cuda":
             row["reserved"] = torch.cuda.memory_reserved()
         emit(stage=row)
         return row
 
-    stage("start")
+    initial = stage("start")
     import torch
 
     stage("import torch")
@@ -571,40 +553,42 @@ def measure(cli, method: str) -> None:
         [block, [[row, None if row in unmeasured else rows[row]] for row in names]]
         for block, names in PEAK_BLOCKS
     ]
-    groups += [
-        [
-            "Process RSS after the step (separate accounting view)",
-            [
-                ["Anonymous resident pages", s_done["anon"]],
-                ["Shared-memory resident pages", s_done["shmem"]],
-                ["File-backed resident pages", s_done["files"]],
-            ],
-        ],
-    ]
     for group in groups:  # each block carries its total
         values = [value for _, value in group[1] if value is not None]
         group.insert(1, sum(values) if values else None)
-    summary = [
-        ["Maximum training state during the step", metrics["training_state_peak"]],
-        ["Training state at overall requested peak", groups[0][1]],
+    totals = [
         [
-            "Saved state at end of forward (including masks)",
+            "A + B = GPU memory used",
+            groups[0][1] + groups[1][1] if cuda else None,
+        ],
+        [
+            "A + B + C = GPU memory reserved",
+            sum(group[1] for group in groups) if cuda else None,
+        ],
+    ]
+    summary = [
+        ["Peak GPU memory used", metrics["requested_peak"]],
+        ["Training state at that moment", groups[0][1]],
+        ["Other working memory at that moment", groups[1][1]],
+        ["GPU memory reserved at that moment", metrics["reserved_at_requested_peak"]],
+        ["Peak GPU memory reserved", metrics["reserved_peak"]],
+        ["Peak training state", metrics["training_state_peak"]],
+        [
+            "Saved for backward",
             metrics["forward_saved_activations"] + metrics["forward_saved_bitmasks"],
         ],
-        ["Saved activations at end of forward", metrics["forward_saved_activations"]],
-        ["Saved ReLU bitmasks at end of forward", metrics["forward_saved_bitmasks"]],
-        ["Optimizer state", rows["Optimizer state"]],
-        ["Maximum requested CUDA memory", metrics["requested_peak"]],
-        ["Maximum reserved CUDA memory", metrics["reserved_peak"]],
-        ["Reserved CUDA memory at requested peak", metrics["reserved_at_requested_peak"]],
-        ["Process RSS after the step", s_done["rss"]],
-        ["Private resident pages (smaps_rollup)", s_done["private"]],
-        ["Proportional resident pages (PSS)", s_done["pss"]],
+        ["Whole-device RAM in use", s_done["device_ram_used"]],
     ]
+    metrics.update(
+        device_ram_before=initial["device_ram_used"],
+        device_ram_after=s_done["device_ram_used"],
+        device_ram_total=s_done["device_ram_total"],
+    )
     emit(
         device=str(device),
         verified=verified,
         groups=groups,
+        totals=totals,
         summary=summary,
         timeline=timeline,
         metrics=metrics,
@@ -613,11 +597,10 @@ def measure(cli, method: str) -> None:
     )
 
 
-def run_child(label: str, method: str, report: dict, monitor: Monitor) -> None:
+def run_child(label: str, method: str, report: dict) -> None:
     """Measure one method in a fresh process, so it pays for its own libraries."""
     command = [sys.executable, __file__, *sys.argv[1:], "--child", method]
     child = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
-    monitor.pid = child.pid  # the chart follows this process's memory
     assert child.stdout  # piped above
     for line in child.stdout:
         if not line.startswith(MARK):
@@ -632,7 +615,6 @@ def run_child(label: str, method: str, report: dict, monitor: Monitor) -> None:
         if message.get("verified") is False:
             print(f"{label}: the allocator trace does not match PyTorch's peak")
     code = child.wait()
-    monitor.pid = None
     if code:
         print(f"{label}: the measurement failed, see the error above")
 
@@ -654,6 +636,9 @@ def print_summary(report: dict) -> None:
         line(f"{group} (total)", [r["groups"][g][1] for r in results])
         for i, (name, _) in enumerate(rows):
             line(f"  {name}", [r["groups"][g][2][i][1] for r in results])
+    print()
+    for i, (name, _) in enumerate(results[0]["totals"]):
+        line(f"{name} (same moment)", [r["totals"][i][1] for r in results])
 
 
 def main() -> int:
@@ -748,7 +733,7 @@ def main() -> int:
 
     for label in report["runs"]:
         time.sleep(3)  # a short gap between the runs on the charts
-        run_child(label, RUNS[label], report, monitor)
+        run_child(label, RUNS[label], report)
     with LOCK:
         report["done"] = True
     print()
@@ -795,11 +780,15 @@ h1 { font-size: 19px; margin: 0; } h2 { font-size: 15px; margin: 0 0 4px; }
 .pair { display: flex; justify-content: space-between; gap: 8px; font-size: 16px;
   font-weight: 600; font-variant-numeric: tabular-nums; }
 .note { color: var(--ink2); font-size: 12px; font-weight: 400; line-height: 1.35; }
-#guide ul { margin: 6px 0 0; padding-left: 18px; color: var(--ink2); }
-#guide li { margin: 4px 0; } #guide b { color: var(--ink); }
+.card > .note { margin-top: 8px; }
+.section { margin-top: 22px; }
+.equation { padding: 8px 0; font-weight: 600; }
+.table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 td { padding: 3px 8px; vertical-align: top; }
 tr.group td { font-weight: 600; padding-top: 12px; border-bottom: 1px solid var(--line); }
+tr.total td { padding-top: 10px; padding-bottom: 10px;
+  font-weight: 700; border-top: 2px solid var(--axis); }
 td.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums;
   width: 110px; }
 td.bar { width: 26%; } .fill { height: 6px; margin: 2px 0; border-radius: 0 3px 3px 0; }
@@ -816,38 +805,18 @@ svg { display: block; width: 100%; }
 <main>
   <h1 id="title">MemFLoRA memory</h1>
   <div class="sub" id="status">waiting for data…</div>
-  <div class="tiles" id="tiles"></div>
-  <div class="card" id="guide">
-    <h2>How this is measured</h2>
-    <ul>
-      <li><b>PyTorch memory at the step's peak.</b> One training step runs with
-        PyTorch's allocator history on. Replaying it finds the moment the most memory
-        was requested, and every block alive then is attributed by its address: model
-        state, optimizer state, gradients, the tensors autograd saved in this step's
-        forward pass, temporaries allocated during the step, and blocks that existed
-        before it. The allocator's cache and rounding make up the rest of what it had
-        reserved. The replayed peak is checked against PyTorch's own peak
-        requested-byte counter. The maximum reserved memory is checked separately;
-        those checks do not validate the category labels or Linux RSS.</li>
-      <li><b>The step timelines.</b> The same replay over the whole step: what is
-        kept between steps, saved tensors, gradients and temporaries, stacked, with
-        reserved memory as a dashed line. The horizontal axis is allocator event
-        order, not elapsed time. Each category in the breakdown is a snapshot at
-        the overall requested peak; it is not that category's maximum.</li>
-      <li><b>Process memory.</b> Linux RSS is anonymous + shared-memory + file-backed
-        resident pages. Private pages and PSS are read separately from
-        <code>smaps_rollup</code>, where available. These overlap with each other
-        and potentially with CUDA allocations. They must not be added to the CUDA
-        breakdown. GPU inclusion in RSS depends on the JetPack/kernel version.
-        Process counters are sampled after synchronization, not at the CUDA peak.</li>
-      <li><b>Comparison with the paper.</b> Maximum training state and saved state
-        at the end of forward are reported separately from total execution memory.
-        The saved-state total includes packed masks and small backward constants.
-        CUDA temporaries, checkpoint copies and allocator cache are additional costs.
-        Inputs and weights here are synthetic; no accuracy experiment is run.</li>
-    </ul>
+  <div class="note">One training step after warm-up, using random inputs and weights.
+    GPU figures cover PyTorch-managed memory. All values are in MB.</div>
+  <div id="tiles"></div>
+  <div class="card" id="breakdown" hidden>
+    <h2>What adds up at peak GPU use</h2>
+    <div class="note">All rows below refer to the same moment for each method:
+      when its GPU memory use is highest. Each A, B or C subtotal adds the rows below it.</div>
+    <div class="equation">A + B = used &nbsp; &middot; &nbsp; A + B + C = reserved</div>
+    <div class="table-scroll"><table id="table"></table></div>
+    <div class="note">This is the reserved memory at that moment.
+      The peak reserved during the whole step can be higher.</div>
   </div>
-  <div class="card" id="breakdown" hidden><table id="table"></table></div>
   <div id="steps"></div>
   <div id="charts"></div>
   <details class="card"><summary>Run configuration and build information</summary>
@@ -862,39 +831,69 @@ const $ = (id) => document.getElementById(id);
 const MB = (b) => (b == null ? "n/a" : (b / 1e6).toFixed(2) + " MB");
 const NS = "http://www.w3.org/2000/svg";
 const CHARTS = [
-  ["Memory of the measured process", "MB",
-    [["Process RSS", "rss"], ["File-backed RSS (included in total)", "files"]]],
+  ["Whole-device RAM in use", "MB", [["RAM in use", "device_ram"]]],
   ["GPU load", "%", [["GPU", "gpu"]], 100],
   ["CPU load", "%", [["Average of all cores", "cpu"], ["Busiest core", "cpu_max"]], 100],
   ["Input power", "W", [["VDD_IN", "power"]]],
 ];
-const KINDS = ["Kept between steps", "Saved tensors", "Gradients", "Temporaries and workspace"];
+const KINDS = ["Already held before the step", "Saved for backward", "Weight gradients", "Working buffers"];
+const SECTIONS = [
+  ["At peak GPU use", "These four boxes describe the same moment for each method.", [
+    "Peak GPU memory used", "Training state at that moment",
+    "Other working memory at that moment", "GPU memory reserved at that moment",
+  ]],
+  ["Training footprint", "These values can occur at different moments; do not add them together.", [
+    "Peak GPU memory reserved", "Peak training state", "Saved for backward",
+  ]],
+  ["Whole device", "A separate view of the device, including the OS and other programs.", [
+    "Whole-device RAM in use",
+  ]],
+];
+const BOX_NOTES = {
+  "Peak GPU memory used": "The most memory occupied by PyTorch tensors and working buffers. " +
+    "Training state (A) + other working memory (B). Unused cache is excluded.",
+  "Training state at that moment": "A: model weights, optimizer data, weight gradients, " +
+    "and saved activations and masks. This is part of the used total beside it.",
+  "Other working memory at that moment": "B: temporary buffers, inputs, a saved model copy " +
+    "and other allocations. Added to A, this gives peak GPU memory used.",
+  "GPU memory reserved at that moment": "Memory PyTorch holds from the GPU: used memory " +
+    "(A + B), plus cache and allocation overhead (C). Some is available for reuse.",
+  "Peak GPU memory reserved": "The most memory PyTorch held from the GPU at any point " +
+    "during the step, including its cache. It can peak at a different moment than used memory.",
+  "Peak training state": "The largest combined A total during the step. This measures " +
+    "training state only; running the step also needs working memory.",
+  "Saved for backward": "Activations and masks kept after the forward pass to calculate " +
+    "gradients. This is part of training state, not an extra amount to add to it.",
+  "Whole-device RAM in use": "Estimated RAM use after the training step finishes. " +
+    "Includes the OS and other programs, so it depends on what else is running. " +
+    "This is not a peak or a per-method cost; do not add it to the GPU figures.",
+};
+const LABELS = {
+  "Model state": "Model weights and buffers",
+  "Optimizer state": "Optimizer data",
+  "Parameter gradients": "Weight gradients",
+  "Saved activations": "Saved activations and small constants",
+  "Saved ReLU bitmasks": "Saved activation masks",
+  "Temporaries and workspace": "Temporary working buffers",
+  "Input batch": "Input data",
+  "Best-checkpoint copy": "Saved model copy",
+  "Other allocations kept between steps": "Other allocations held before the step",
+  "Allocator cache and rounding": "Cache and allocation overhead",
+};
 const NOTES = {  // shown under each block and row of the table
-  "Training state at the step's peak":
-    "What training itself holds at the moment of the step's peak.",
-  "Other PyTorch memory at the peak":
-    "The rest of what PyTorch's allocator had reserved at that moment.",
-  "Process RSS after the step (separate accounting view)":
-    "Linux resident pages after synchronization. Do not add this to CUDA memory.",
-  "Model state": "Every weight and buffer: frozen backbone, adapters, BatchNorm statistics.",
-  "Optimizer state": "Adam's two moment buffers for each trainable weight.",
-  "Parameter gradients": "Gradients already computed when the peak happens.",
-  "Saved activations": "Saved non-mask storage alive at the overall peak, including " +
-    "small backward constants. The end-of-forward total is reported separately.",
-  "Saved ReLU bitmasks": "Packed ReLU/ReLU6 gates alive at the overall peak. " +
-    "Zero is possible when the peak precedes mask creation; see the forward-end tile.",
-  "Temporaries and workspace": "Everything else allocated during the step and alive at " +
-    "the peak: layer outputs, gradients flowing backward, cuDNN workspaces.",
-  "Input batch": "The current mini-batch of windows and labels.",
-  "Best-checkpoint copy": "The benchmark keeps a copy of the weights to restore its best " +
-    "step.",
-  "Other allocations kept between steps": "Allocated before the step by something other " +
-    "than the tensors above. Their individual owners have not been identified.",
-  "Allocator cache and rounding": "Reserved from the driver but not requested by any " +
-    "tensor at the peak: cached blocks, rounding and pending stream-delayed frees.",
-  "Anonymous resident pages": "RssAnon; not an allocator or library attribution.",
-  "Shared-memory resident pages": "RssShmem, which includes shared anonymous and tmpfs mappings.",
-  "File-backed resident pages": "RssFile: all resident file mappings, not only library code.",
+  "Model state": "All model weights, including frozen weights, and stored model statistics.",
+  "Optimizer state": "Information Adam keeps to update trainable weights.",
+  "Parameter gradients": "Gradients calculated so far, used to update trainable weights.",
+  "Saved activations": "Intermediate values still kept for calculating gradients.",
+  "Saved ReLU bitmasks": "Packed ReLU/ReLU6 gates. Zero can mean they are not created yet " +
+    "or have already been released. Full FT does not use MemFLoRA's packed masks.",
+  "Temporaries and workspace": "Short-lived buffers used while calculating outputs and gradients.",
+  "Input batch": "The current batch of inputs and labels.",
+  "Best-checkpoint copy": "A second copy of the weights, kept to restore the best training step.",
+  "Other allocations kept between steps": "Other memory already held before this step; " +
+    "its exact owners have not been identified.",
+  "Allocator cache and rounding": "Reserved memory beyond the live allocations: " +
+    "reusable cache, unused space inside allocated blocks, and memory awaiting release.",
 };
 let data = null, hoverT = null;
 
@@ -943,10 +942,10 @@ function render() {
     (EMBEDDED ? "" : " · live, refreshes every second") + (first ? ` · ${first.device}` : ""));
   const checks = results.filter(Boolean).map((r) => r.verified);
   if (checks.includes(false)) {
-    $("status").append(node("span", " · allocator trace does not match PyTorch's peak " +
-      "counter, peak rows are unreliable", "warn"));
+    $("status").append(node("span", " · memory totals failed the cross-check; " +
+      "treat these figures as unreliable", "warn"));
   } else if (checks.length && checks.every((v) => v === true)) {
-    $("status").append(" · requested/reserved peaks checked; category attribution is not independently verified");
+    $("status").append(" · peak totals checked against PyTorch");
   }
   if (first) renderTables(d, results, first);
   $("metadata").textContent = JSON.stringify(Object.fromEntries(
@@ -960,26 +959,50 @@ function render() {
 function renderTables(d, results, first) {
   const cell = (r, value) => (r ? MB(value) : d.done ? "failed" : "…");
   const color = (k) => `var(--s${k + 1})`;
-  $("tiles").replaceChildren(...first.summary.map(([label], i) => {
-    const card = node("div", null, "card");
-    card.append(node("div", label, "label"));
-    d.runs.forEach((run, k) => {
-      const pair = node("div", null, "pair");
-      pair.append(keyed(color(k), run),
-        node("span", cell(results[k], results[k]?.summary[i][1])));
-      card.append(pair);
+  const summaries = results.map((r) => new Map(r?.summary || []));
+  $("tiles").replaceChildren(...SECTIONS.map(([heading, explanation, labels]) => {
+    const section = node("section", null, "section");
+    section.append(node("h2", heading), node("div", explanation, "note"));
+    const grid = node("div", null, "tiles");
+    labels.forEach((label) => {
+      const card = node("div", null, "card");
+      card.append(node("div", label, "label"));
+      d.runs.forEach((run, k) => {
+        const pair = node("div", null, "pair");
+        pair.append(keyed(color(k), run), node("span", cell(results[k], summaries[k].get(label))));
+        card.append(pair);
+        const m = results[k]?.metrics;
+        if (m && label === "Saved for backward") {
+          card.append(node("div", `${MB(m.forward_saved_activations)} activations + ` +
+            `${MB(m.forward_saved_bitmasks)} masks`, "note"));
+        }
+        if (m && label === "Whole-device RAM in use") {
+          card.append(node("div", `Before the run: ${MB(m.device_ram_before)} · ` +
+            `Usable device RAM: ${MB(m.device_ram_total)}`, "note"));
+        }
+      });
+      card.append(node("div", BOX_NOTES[label], "note"));
+      grid.append(card);
     });
-    return card;
+    section.append(grid);
+    return section;
   }));
   const head = node("tr", null, "group");
   head.append(node("td"), ...d.runs.map((run, k) => keyed(color(k), run, "td", "num")),
     node("td"));
   const rows = [head];
   const named = (text, suffix) => {  // a name cell with its explanation underneath
-    const n = node("td", text);
+    const n = node("td", LABELS[text] || text);
     if (suffix) n.append(node("span", suffix, "label"));
     if (NOTES[text]) n.append(node("div", NOTES[text], "note"));
     return n;
+  };
+  const addTotal = (i) => {
+    const [label] = first.totals[i];
+    const total = node("tr", null, "total");
+    total.append(named(label),
+      ...results.map((r) => node("td", cell(r, r?.totals[i][1]), "num")), node("td"));
+    rows.push(total);
   };
   first.groups.forEach(([group, , items], g) => {
     const total = node("tr", null, "group");
@@ -1000,6 +1023,8 @@ function renderTables(d, results, first) {
         ...values[i].map((value, k) => node("td", cell(results[k], value), "num")), bar);
       rows.push(row);
     });
+    if (g === 1) addTotal(0);
+    if (g === 2) addTotal(1);
   });
   $("breakdown").hidden = false;
   $("table").replaceChildren(...rows);
@@ -1014,10 +1039,12 @@ function drawSteps(d) {  // the allocator during each run's measured step, one s
   for (const run of runs) {
     const { points, ends, peak, events } = d.results[run].timeline;
     const card = node("div", null, "card");
-    const heading = node("h2", `${run}: PyTorch memory during the measured step (MB)`);
+    const heading = node("h2", `${run}: GPU memory during the training step (MB)`);
     KINDS.forEach((name, i) => heading.append(keyed(`var(--k${i})`, name, "span", "label legend")));
-    heading.append(keyed("var(--ink2)", "Reserved", "span", "label legend"));
+    heading.append(keyed("var(--ink2)", "Held by PyTorch (reserved)", "span", "label legend"));
     card.append(heading);
+    card.append(node("div", "The colored areas add up to memory used. The dashed line " +
+      "also includes cache and allocation overhead. Left to right follows memory operations, not elapsed time.", "note"));
     $("steps").append(card);
     const W = card.clientWidth - 28, H = 170, L = 46, R = 10, T = 18, B = 8;
     const svg = svgNode(card, "svg", { viewBox: `0 0 ${W} ${T + H + B}` });
@@ -1059,6 +1086,10 @@ function drawChart(title, unit, series, yMax) {
       heading.append(keyed(`var(--s${i + 1})`, name, "span", "label legend")));
   }
   card.append(heading);
+  if (title === CHARTS[0][0]) {
+    card.append(node("div", "Estimated RAM use for the whole device, including the OS and " +
+      "other programs. Sampled about twice per second; brief peaks may be missed.", "note"));
+  }
   $("charts").append(card);
   const W = card.clientWidth - 28, H = 150, L = 46, R = 10, T = labelled ? 34 : 12, B = 22;
   const svg = svgNode(card, "svg", { viewBox: `0 0 ${W} ${T + H + B}` });
