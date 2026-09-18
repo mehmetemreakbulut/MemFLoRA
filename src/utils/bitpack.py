@@ -3,6 +3,8 @@ import math
 from typing import Tuple
 import torch
 
+from src.utils._bitpack_cuda import cuda_extension
+
 _BIT_WEIGHTS_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
@@ -27,6 +29,10 @@ def pack_bool_mask(mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Size]:
     if mask.dtype != torch.bool:
         raise TypeError(f"pack_bool_mask expects torch.bool input, got {mask.dtype}")
     original_shape = mask.shape
+    if mask.is_cuda and mask.numel():
+        extension = cuda_extension()
+        if extension is not None:
+            return extension.pack_bool(mask.contiguous()), original_shape
     flat = mask.reshape(-1)
     numel = int(flat.numel())
     if numel == 0:
@@ -38,8 +44,34 @@ def pack_bool_mask(mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Size]:
         )
     bits = flat.to(torch.uint8).view(-1, 8)
     weights = _bit_weights(mask.device).view(1, 8)
-    packed = (bits * weights).sum(dim=1).to(torch.uint8)
+    # The sum of eight distinct bit weights is at most 255. Explicit uint8
+    # avoids the default int64 conversion of the entire input to the reduction.
+    packed = bits.mul_(weights).sum(dim=1, dtype=torch.uint8)
     return packed, original_shape
+
+
+def activate_and_pack_(tensor: torch.Tensor, activation: int) -> torch.Tensor:
+    """Activate a fresh preactivation in place and return its packed gradient gate.
+
+    Intended for custom autograd forward functions, where grad recording is off.
+    Non-contiguous layouts and CPU tensors use the equivalent torch path.
+    """
+    if activation not in (1, 2):
+        raise ValueError("activation must be 1 (ReLU) or 2 (ReLU6)")
+    if torch.is_grad_enabled() and tensor.requires_grad:
+        raise RuntimeError("activate_and_pack_ must run inside a custom/no-grad forward")
+    if tensor.is_cuda and tensor.is_contiguous() and tensor.numel():
+        extension = cuda_extension()
+        if extension is not None:
+            return extension.activate_pack_(tensor, activation)
+    mask = tensor > 0
+    if activation == 2:
+        mask.logical_and_(tensor < 6)
+        tensor.clamp_(min=0, max=6)
+    else:
+        tensor.relu_()
+    packed, _ = pack_bool_mask(mask)
+    return packed
 
 
 def unpack_bool_mask(packed: torch.Tensor, original_shape: torch.Size) -> torch.Tensor:

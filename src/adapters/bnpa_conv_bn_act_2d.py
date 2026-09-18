@@ -129,6 +129,7 @@ class BNPAConvBNAct2DFunction(Function):
             if post_bn_adapter_scale_by_source_bn:
                 adapter_out.mul_(bn_scale_view)
             base_out.add_(adapter_out, alpha=float(scale))
+        del adapter_out
         s = base_out
         y, activation_mask = fused_activation_inplace(ctx, s, activation)
         ctx.needs_x_grad = bool(ctx.needs_input_grad[0])
@@ -368,6 +369,7 @@ class BNPAConvBNAct2DPostBNScaledOptimizedFunction(Function):
         base_out.mul_(bn_scale_view).add_(bn_shift.view(1, -1, 1, 1))
         adapter_out.mul_(bn_scale_view)
         base_out.add_(adapter_out, alpha=float(scale))
+        del adapter_out
         s = base_out
         y, activation_mask = fused_activation_inplace(ctx, s, activation)
         ctx.needs_x_grad = bool(ctx.needs_input_grad[0])

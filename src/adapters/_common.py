@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from src.utils.adabn import update_batch_norm_running_stats
-from src.utils.bitpack import pack_bool_mask, unpack_bool_mask
+from src.utils.bitpack import activate_and_pack_, pack_bool_mask, unpack_bool_mask
 
 ActivationMaskMode = Literal["bool", "bitpack"]
 
@@ -149,18 +149,10 @@ def fused_activation_inplace(
     ctx.activation_mask_shape = tuple()
     if activation == 0:
         return s, torch.empty(0, device=s.device, dtype=torch.uint8)
-    if activation == 1:
-        mask = s > 0
-        y = torch.relu_(s)
-    elif activation == 2:
-        mask = s > 0
-        mask.logical_and_(s < 6)
-        y = s.clamp_(min=0, max=6)
-    else:
+    if activation not in (1, 2):
         raise NotImplementedError(f"Unsupported activation code: {activation}")
-    packed, _shape = pack_bool_mask(mask)
-    ctx.activation_mask_shape = tuple(mask.shape)
-    return y, packed
+    ctx.activation_mask_shape = tuple(s.shape)
+    return s, activate_and_pack_(s, activation)
 
 
 def _activation_code(activation: Optional[nn.Module]) -> int:

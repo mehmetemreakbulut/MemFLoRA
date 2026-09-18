@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest==9.0.3", "black==26.5.1"]
+cuda-kernels = ["ninja>=1.11"]
 
 [tool.setuptools]
 # The import root is `src` (modules are imported as `from src.adapters import ...`),
@@ -34,6 +35,9 @@ packages = { find = { include = ["src*"] } }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+"src.utils" = ["csrc/*.cpp", "csrc/*.cu"]
 
 [tool.black]
 line-length = 88

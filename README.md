@@ -140,6 +140,58 @@ group:
 Output goes to `$RESULTS_ROOT`, which defaults to `runs/`. Some of these sweeps
 are large and take days on a CPU, so read a script before you start it.
 
+## Jetson memory report and CUDA packing
+
+`tools/jetson_memory.py` compares MemFLoRA and full fine-tuning in separate
+processes using random weights and Opportunity-shaped synthetic inputs. It does
+not reproduce the paper's accuracy experiment. AdaBN calibration is off by
+default; `--use-adabn` enables one calibration batch.
+
+```bash
+python tools/jetson_memory.py --model mobilenetv2 --rank 2 --batch 64 \
+  --bitpack-backend cuda
+```
+
+The report is served at `http://127.0.0.1:8000`; Ctrl+C saves `report.html` beside
+`data.json` under `runs/jetson_memory_mobilenetv2_r2/`. Over SSH, forward port 8000.
+Use `--out` to keep comparisons in separate directories.
+
+The optional CUDA extension packs eight gates per byte and fuses ReLU/ReLU6 with
+packing for contiguous adapted and frozen blocks. This avoids a full-size boolean
+mask in those blocks. The torch fallback also avoids the previous int64 packing
+reduction. Backward uses the existing unpacker and gradient formulas.
+
+Building the extension requires a CUDA-enabled PyTorch compatible with your
+JetPack installation, the CUDA toolkit (`nvcc`), a C++ compiler, and `ninja`
+(`pip install ninja`). Keep your Jetson-compatible PyTorch installation. The
+extension builds on first use and is cached by PyTorch; the profiler prepares it
+before warm-up. Compilation defaults to one job to limit RAM use; `MAX_JOBS` can
+override this. Copy the changed `src/` files, including `src/utils/csrc/`, to the
+Jetson together with the profiler.
+
+- `--bitpack-backend cuda` requires the compiled kernel and fails if it cannot load.
+- `--bitpack-backend auto` (default) attempts compilation and warns before falling
+  back to torch if the build fails.
+- `--bitpack-backend torch` uses only torch operations, with no compilation.
+
+For the main benchmark, select the same behavior with the environment variable
+`MEMFLORA_BITPACK_BACKEND=cuda`, `auto`, or `torch`.
+
+The report separates maximum requested CUDA memory, maximum reserved memory,
+maximum training state, and saved state at the end of forward. Its category table
+is a snapshot at the overall requested peak: a zero mask row can mean the peak
+occurred before masks were created or after they were released. Full fine-tuning
+does not use MemFLoRA's packed masks. Linux RSS, private pages, and PSS are separate
+views and must not be added to CUDA memory or used to infer library overhead by
+subtracting CUDA bytes. Source hashes, software versions, and kernel backend
+status are included in the report.
+
+`--trace-stacks --save-snapshot` records allocation stacks and saves PyTorch
+allocator snapshots for investigation; stack recording adds overhead.
+`--reverse-order` measures full fine-tuning first. With calibration enabled,
+`--empty-cache-after-calibration` releases unused cached CUDA blocks after
+calibration; it does not free live tensors or guarantee a lower training peak.
+
 ## What's where
 
 ```text
@@ -172,6 +224,16 @@ black --check src experiments tests
 The tests don't need any data. They check bit packing, compare the BNPA backward
 against a plain autograd reference, and exercise adapter injection and the CSV
 output. Code is formatted with black at the default 88 columns.
+
+Compiled-kernel tests are opt-in and require CUDA and the build tools above:
+
+```bash
+MEMFLORA_TEST_CUDA_KERNEL=1 pytest tests/test_bitpack.py tests/test_fused_packing_blocks.py
+```
+
+These check byte order, tail padding, activation boundaries, non-default CUDA
+streams, and block outputs/gradients. `tests/test_jetson_memory.py` checks profiler
+accounting with synthetic traces and mocked Linux counters.
 
 ## License
 

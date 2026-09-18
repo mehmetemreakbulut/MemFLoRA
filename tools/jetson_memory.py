@@ -3,30 +3,31 @@
     python tools/jetson_memory.py --model tresnet --rank 2
     python tools/jetson_memory.py --model mobilenetv2 --rank 2
 
-Each method runs in its own fresh process, and every memory number comes from
-that process alone, so none depends on other processes or on which method ran
-first. Inside PyTorch's allocator, the measured training step is recorded
-allocation by allocation, and every block alive at the step's peak is attributed
-to what owns it. Outside the allocator, each phase is charged the private memory
-it added to the process; on a Jetson that includes GPU memory, since the GPU
-shares the RAM.
+Each method runs in a fresh process. The CUDA allocator trace reports requested
+and reserved peaks separately, plus the training-state maximum and the category
+breakdown at the overall requested peak. Process RSS/PSS are independent views;
+they are never added to, or reduced by, CUDA bytes. GPU inclusion in Linux RSS
+depends on the JetPack/kernel, not just whether the GPU uses shared RAM.
 
 The report is served at http://127.0.0.1:8000 and refreshes itself every second.
 Over SSH, open a tunnel first: ssh -L 8000:localhost:8000 <jetson>. Press Ctrl+C
 when done; a standalone copy is saved as report.html. Numbers are in MB (10^6 B).
 
 The step uses random weights and random windows of the Opportunity shape (97
-channels x 60 steps); its memory depends only on tensor shapes. AdaBN calibration
-is skipped unless --use-adabn is given.
+channels x 60 steps). This is a synthetic memory experiment, not a paper accuracy
+run. AdaBN calibration is skipped unless --use-adabn is given. The optional CUDA
+packing extension is prepared before warm-up; its first use may compile it.
 """
 
 from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import http.server
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -57,7 +58,7 @@ COMMON_ARGS = (
     " --adabn-calibration-mode ema_no_reset --bnpa-bottleneck-bn on"
     " --adabn-stat-source target --train_mode_adaBN off"
 )
-# Rows of the peak breakdown; the first block follows Table 3 of the paper.
+# Category snapshots at the overall requested-byte peak, not separate maxima.
 PEAK_BLOCKS = [
     [
         "Training state at the step's peak",
@@ -84,8 +85,8 @@ MARK = "@jetson_memory "  # marks the lines a measuring child sends back
 LOCK = threading.Lock()
 
 
-def resident(pid="self") -> dict:
-    """A process's resident memory: private (anon and shmem) and mapped files."""
+def resident(pid="self", detailed=False) -> dict:
+    """Linux process counters; no assumptions about CUDA/RSS overlap."""
     try:
         with open(f"/proc/{pid}/status") as f:
             info = {
@@ -97,7 +98,28 @@ def resident(pid="self") -> dict:
         return {}
     if "RssAnon" not in info:  # exited, not yet reaped
         return {}
-    return {"private": info["RssAnon"] + info["RssShmem"], "files": info["RssFile"]}
+    result = {
+        "anon": info["RssAnon"],
+        "shmem": info["RssShmem"],
+        "files": info["RssFile"],
+        "rss": sum(info[key] for key in ("RssAnon", "RssShmem", "RssFile")),
+    }
+    if detailed:
+        try:
+            with open(f"/proc/{pid}/smaps_rollup") as f:
+                smaps = {
+                    line.split(":")[0]: int(line.split()[1]) * 1024
+                    for line in f
+                    if line.startswith(("Private_", "Pss:"))
+                }
+            result["private"] = sum(
+                smaps.get(key, 0)
+                for key in ("Private_Clean", "Private_Dirty", "Private_Hugetlb")
+            )
+            result["pss"] = smaps.get("Pss")
+        except OSError:
+            result.update(private=None, pss=None)
+    return result
 
 
 class Monitor(threading.Thread):
@@ -131,7 +153,7 @@ class Monitor(threading.Thread):
     def add(self, sample: dict) -> None:
         memory = resident(self.pid) if self.pid else {}
         if memory:
-            sample["private"] = round(memory["private"] / 1e6, 1)
+            sample["rss"] = round(memory["rss"] / 1e6, 1)
             sample["files"] = round(memory["files"] / 1e6, 1)
         with LOCK:
             self.samples.append({"t": time.time(), **sample})
@@ -197,17 +219,17 @@ def replay(trace: list, before: dict, reserved: int, kind) -> tuple:
 def attribute(trace, before, reserved, phases, saved, grads, owners):
     """Attribute every block live at the step's peak to a row of the table.
 
-    `phases` holds how many allocations the step had made by the end of its
-    forward and its backward pass, `saved` maps the storage of each tensor
+    `phases` holds trace-event offsets at the end of the forward and backward
+    passes, `saved` maps the storage of each tensor
     autograd saved to its row, `grads` holds the gradients' storages and `owners`
-    maps the tensors kept between steps to their row. Returns the rows, the bytes
-    reserved and requested at the peak, the bytes the forward pass saved, and the
-    step's timeline.
+    maps the tensors kept between steps to their row. Returns peak rows,
+    independent maxima and forward-end metrics, and the step's timeline.
+    Saved-state bytes exclude pre-existing model/optimizer/input storage.
     """
     allocs = [(i, e) for i, e in enumerate(trace) if e["action"] == "alloc"]
     # A saved tensor is the last block allocated at its address in the forward
     # pass; a gradient is the last block allocated at its address at all.
-    forward = {event["addr"]: i for i, event in allocs[: phases[0]]}
+    forward = {event["addr"]: i for i, event in allocs if i < phases[0]}
     saved_at = {forward[a]: row for a, row in saved.items() if a in forward}
     last = {event["addr"]: i for i, event in allocs}
     grads_at = {last[a] for a in grads if a in last}
@@ -229,6 +251,42 @@ def attribute(trace, before, reserved, phases, saved, grads, owners):
         rows[row] = rows.get(row, 0) + size
     peak, held = sum(series[peak_at][:4]), series[peak_at][4]
     rows["Allocator cache and rounding"] = held - peak
+    # Model and Adam storage is stable after warm-up. Track its lifetime too,
+    # so a released pre-existing block cannot inflate the independent maximum.
+    state_base = sum(
+        size
+        for address, size in before.items()
+        if owners.get(address) in ("Model state", "Optimizer state")
+    )
+    live_base = dict(before)
+    training_peak = state_base + series[0][1] + series[0][2]
+    for i, event in enumerate(trace):
+        if event["action"] in ("free_requested", "free_completed"):
+            address = event.get("addr")
+            size = live_base.pop(address, 0)
+            if owners.get(address) in ("Model state", "Optimizer state"):
+                state_base -= size
+        training_peak = max(
+            training_peak, state_base + series[i + 1][1] + series[i + 1][2]
+        )
+    forward_live = {}
+    for i, event in enumerate(trace[: phases[0]]):
+        if event["action"] == "alloc":
+            forward_live[event["addr"]] = i
+        elif event["action"] in ("free_requested", "free_completed"):
+            forward_live.pop(event.get("addr"), None)
+    forward_bytes = {"Saved activations": 0, "Saved ReLU bitmasks": 0}
+    for i in forward_live.values():
+        if i in saved_at:
+            forward_bytes[saved_at[i]] += trace[i]["size"]
+    metrics = {
+        "requested_peak": peak,
+        "reserved_at_requested_peak": held,
+        "reserved_peak": max(point[4] for point in series),
+        "training_state_peak": training_peak,
+        "forward_saved_activations": forward_bytes["Saved activations"],
+        "forward_saved_bitmasks": forward_bytes["Saved ReLU bitmasks"],
+    }
     # About 300 points, each the highest of its stretch, so the peak survives.
     stretch = max(1, len(series) // 300)
     points = [
@@ -238,40 +296,92 @@ def attribute(trace, before, reserved, phases, saved, grads, owners):
         )
         for s in range(0, len(series), stretch)
     ]
-    ends = [allocs[n - 1][0] + 1 if n else 0 for n in phases]  # where phases end
-    timeline = {"points": points, "ends": ends, "peak": peak_at, "events": len(trace)}
-    return rows, held, peak, sum(trace[i]["size"] for i in saved_at), timeline
+    # Keep exact boundaries and both peaks even when downsampling the plot.
+    exact = {
+        0,
+        len(trace),
+        *phases,
+        peak_at,
+        max(range(len(series)), key=lambda i: series[i][4]),
+    }
+    points = sorted({p[0]: p for p in points + [[i, *series[i]] for i in exact]}.values())
+    timeline = {"points": points, "ends": phases, "peak": peak_at, "events": len(trace)}
+    return rows, metrics, timeline
 
 
 def emit(**message) -> None:
     print(MARK + json.dumps(message), flush=True)
 
 
+def provenance(cli, method, torch, device):
+    """Record enough context to distinguish builds and measurement policies."""
+    from src.utils._bitpack_cuda import backend_status
+
+    def read_optional(path):
+        try:
+            return Path(path).read_text().strip()
+        except OSError:
+            return None
+
+    commit = None
+    if shutil.which("git"):
+        commit = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    sources = [
+        Path(__file__).resolve(),
+        *sorted((ROOT / "src").rglob("*.py")),
+        *sorted((ROOT / "src").rglob("*.cu")),
+        *sorted((ROOT / "src").rglob("*.cpp")),
+        *sorted((ROOT / "experiments").rglob("*.py")),
+        ROOT / "pyproject.toml",
+    ]
+    return {
+        "method": method,
+        "command": sys.argv,
+        "python": platform.python_version(),
+        "kernel": platform.release(),
+        "torch": str(torch.__version__),
+        "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        "device": str(device),
+        "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU",
+        "jetpack_l4t": read_optional("/etc/nv_tegra_release"),
+        "git_commit": commit.stdout.strip() if commit and commit.returncode == 0 else None,
+        "source_sha256": {
+            str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sources
+        },
+        "bitpack": backend_status(),
+        "adabn": cli.use_adabn,
+        "empty_cache_after_calibration": cli.empty_cache_after_calibration,
+        "trace_stacks": cli.trace_stacks,
+        "synthetic_inputs": True,
+        "cuda_rss_overlap": "unknown; counters are not combined",
+    }
+
+
 def measure(cli, method: str) -> None:
     """Measure one method. Runs in a child process and emits what it finds."""
     torch = None
     device = None
-    shared = False  # whether the GPU's buffers are part of this process's RAM
 
     def stage(name: str) -> dict:
-        row = {"name": name, "t": time.time(), **resident()}
         if device is not None and device.type == "cuda":
             torch.cuda.synchronize()
+        row = {"name": name, "t": time.time(), **resident(detailed=True)}
+        if device is not None and device.type == "cuda":
             row["reserved"] = torch.cuda.memory_reserved()
         emit(stage=row)
         return row
 
-    def outside(a: dict, b: dict) -> int:
-        """Private memory a phase added, minus what the allocator reserved in it."""
-        grown = b["private"] - a["private"]
-        if shared:
-            grown -= b.get("reserved", 0) - a.get("reserved", 0)
-        return grown
-
-    s_start = stage("start")
+    stage("start")
     import torch
 
-    s_torch = stage("import torch")
+    stage("import torch")
     sys.path.insert(0, str(ROOT))
     from torch.utils.data import DataLoader, TensorDataset
 
@@ -285,15 +395,19 @@ def measure(cli, method: str) -> None:
     if cli.model == "mobilenetv2":
         import torchvision  # noqa: F401  the model imports it later; count it here
 
-    s_project = stage("import project")
+    stage("import project")
     if cli.cpu or not torch.cuda.is_available():
         device = torch.device("cpu")
     else:
-        device = torch.device("cuda")
+        device = torch.device("cuda", torch.cuda.current_device())
         torch.zeros(1, device=device).add_(1).item()  # fails early on a wrong build
-        shared = bool(torch.cuda.get_device_properties(device).is_integrated)
     torch.manual_seed(1)
-    s_context = stage("cuda context")
+    stage("cuda context")
+    if device.type == "cuda" and method != "full":
+        from src.utils._bitpack_cuda import cuda_extension
+
+        cuda_extension()  # compile/load outside the measured training step
+    stage("packing backend setup")
 
     argv = [*COMMON_ARGS.split(), *MODELS[cli.model][1].split(), "--method", method]
     args = parse_args(argv + ["--rank", str(cli.rank)])
@@ -315,9 +429,13 @@ def measure(cli, method: str) -> None:
     model = build_backbone(args).to(device)
     configure_method(model, args)
     model.to(device)
-    s_model = stage("model")
+    stage("model")
     calibrate_minimal_adabn_if_needed(model, method, loader, args, device)
     stage("calibration")
+    if cli.empty_cache_after_calibration and device.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        stage("release unused calibration cache")
 
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(params, lr=1e-3, weight_decay=args.adapt_weight_decay)
@@ -344,34 +462,41 @@ def measure(cli, method: str) -> None:
     saved = {}  # storage address -> (row, bytes) of each tensor autograd saves
 
     def pack(tensor):
-        if tensor.numel():
+        if tensor.numel() and tensor.device == device:
             storage = tensor.untyped_storage()
             bits = tensor.dtype in (torch.uint8, torch.bool)
             row = "Saved ReLU bitmasks" if bits else "Saved activations"
             saved[storage.data_ptr()] = (row, storage.nbytes())
         return tensor
 
-    def allocations() -> int:
-        return torch.cuda.memory_stats()["allocation.all.allocated"] if cuda else 0
+    def trace_boundary() -> int:
+        # Exact trace offset, including frees after the phase's final allocation.
+        if not cuda:
+            return 0
+        return len(torch.cuda.memory._snapshot()["device_traces"][device.index])
 
     start_step()
     if cuda:
         torch.cuda.synchronize()
-        torch.cuda.memory._record_memory_history("all", context=None)
+        torch.cuda.memory._record_memory_history(
+            "all",
+            context="all" if cli.trace_stacks else None,
+            max_entries=1_000_000,
+        )
         before = {
             block["address"]: block["requested_size"]
             for segment in torch.cuda.memory._snapshot()["segments"]
+            if segment["device"] == device.index
             for block in segment["blocks"]
             if block["state"] == "active_allocated"
         }
         reserved = torch.cuda.memory_reserved()
         torch.cuda.reset_peak_memory_stats()
-    start = allocations()
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         loss = loss_fn(model(x), y)
-    phases = [allocations() - start]
+    phases = [trace_boundary()]
     loss.backward()
-    phases.append(allocations() - start)
+    phases.append(trace_boundary())
     optimizer.step()
     s_done = stage("measured step")
 
@@ -386,7 +511,7 @@ def measure(cli, method: str) -> None:
     }
     for row, tensors in kept.items():
         for tensor in tensors:
-            if tensor.device.type == device.type and tensor.numel():
+            if tensor.device == device and tensor.numel():
                 storage = tensor.untyped_storage()
                 owners.setdefault(storage.data_ptr(), row)
                 sizes[storage.data_ptr()] = storage.nbytes()
@@ -395,15 +520,31 @@ def measure(cli, method: str) -> None:
     unmeasured = set()  # rows only the allocator trace can measure
 
     if cuda:
-        traces = torch.cuda.memory._snapshot()["device_traces"]
-        trace = traces[torch.cuda.current_device()]
+        snapshot = torch.cuda.memory._snapshot()
+        trace = snapshot["device_traces"][device.index]
         torch.cuda.memory._record_memory_history(None)
         kinds = {address: row for address, (row, _) in saved.items()}
-        found, held, peak, saved_total, timeline = attribute(
+        found, metrics, timeline = attribute(
             trace, before, reserved, phases, kinds, grads, owners
         )
         rows.update(found)
-        verified = peak == torch.cuda.memory_stats()["requested_bytes.all.peak"]
+        counters = torch.cuda.memory_stats()
+        checks = {
+            "requested_peak": (
+                metrics["requested_peak"] == counters["requested_bytes.all.peak"]
+            ),
+            "reserved_peak": (
+                metrics["reserved_peak"] == counters["reserved_bytes.all.peak"]
+            ),
+        }
+        verified = all(checks.values())
+        if cli.save_snapshot:
+            import pickle
+
+            out = cli.out or ROOT / "runs" / f"jetson_memory_{cli.model}_r{cli.rank}"
+            out.mkdir(parents=True, exist_ok=True)
+            with (out / f"{method}_snapshot.pickle").open("wb") as f:
+                pickle.dump(snapshot, f)
     else:  # no allocator on the CPU: count every saved tensor and gradient
         for address, row in owners.items():
             rows[row] += sizes[address]
@@ -413,10 +554,18 @@ def measure(cli, method: str) -> None:
         rows["Parameter gradients"] = sum(
             p.grad.nbytes for p in params if p.grad is not None
         )
-        saved_total = rows["Saved activations"] + rows["Saved ReLU bitmasks"]
-        unmeasured = {"Temporaries and workspace", "Allocator cache and rounding"}
-        unmeasured.add("Other allocations kept between steps")
-        held = verified = timeline = None
+        metrics = {
+            "requested_peak": None,
+            "reserved_peak": None,
+            "reserved_at_requested_peak": None,
+            "training_state_peak": None,
+            "forward_saved_activations": rows["Saved activations"],
+            "forward_saved_bitmasks": rows["Saved ReLU bitmasks"],
+        }
+        # CPU bookkeeping is not a live-memory trace; never label it a peak.
+        unmeasured = set(rows)
+        verified = timeline = None
+        checks = {}
 
     groups = [
         [block, [[row, None if row in unmeasured else rows[row]] for row in names]]
@@ -424,30 +573,33 @@ def measure(cli, method: str) -> None:
     ]
     groups += [
         [
-            "Outside PyTorch's allocator: this process",
+            "Process RSS after the step (separate accounting view)",
             [
-                ["Python interpreter", s_start["private"]],
-                ["PyTorch import", outside(s_start, s_torch)],
-                ["Project imports", outside(s_torch, s_project)],
-                ["CUDA context and driver", outside(s_project, s_context)],
-                ["Model and data setup", outside(s_context, s_model)],
-                ["cuDNN and cuBLAS at first use", outside(s_model, s_done)],
+                ["Anonymous resident pages", s_done["anon"]],
+                ["Shared-memory resident pages", s_done["shmem"]],
+                ["File-backed resident pages", s_done["files"]],
             ],
-        ],
-        [
-            "Mapped library files, not counted above",
-            [["Library files mapped into the process", s_done["files"]]],
         ],
     ]
     for group in groups:  # each block carries its total
-        group.insert(1, sum(value for _, value in group[1] if value is not None))
+        values = [value for _, value in group[1] if value is not None]
+        group.insert(1, sum(values) if values else None)
     summary = [
-        ["Training state at the peak", groups[0][1]],
-        ["Saved activations, end of forward pass", saved_total],
+        ["Maximum training state during the step", metrics["training_state_peak"]],
+        ["Training state at overall requested peak", groups[0][1]],
+        [
+            "Saved state at end of forward (including masks)",
+            metrics["forward_saved_activations"] + metrics["forward_saved_bitmasks"],
+        ],
+        ["Saved activations at end of forward", metrics["forward_saved_activations"]],
+        ["Saved ReLU bitmasks at end of forward", metrics["forward_saved_bitmasks"]],
         ["Optimizer state", rows["Optimizer state"]],
-        ["PyTorch memory at the peak", held],
-        ["Process private memory, after the step", s_done["private"]],
-        ["Mapped library files", s_done["files"]],
+        ["Maximum requested CUDA memory", metrics["requested_peak"]],
+        ["Maximum reserved CUDA memory", metrics["reserved_peak"]],
+        ["Reserved CUDA memory at requested peak", metrics["reserved_at_requested_peak"]],
+        ["Process RSS after the step", s_done["rss"]],
+        ["Private resident pages (smaps_rollup)", s_done["private"]],
+        ["Proportional resident pages (PSS)", s_done["pss"]],
     ]
     emit(
         device=str(device),
@@ -455,6 +607,9 @@ def measure(cli, method: str) -> None:
         groups=groups,
         summary=summary,
         timeline=timeline,
+        metrics=metrics,
+        checks=checks,
+        metadata=provenance(cli, method, torch, device),
     )
 
 
@@ -511,11 +666,36 @@ def main() -> int:
     parser.add_argument(
         "--use-adabn", action="store_true", help="calibrate BN on one batch first"
     )
+    parser.add_argument(
+        "--bitpack-backend",
+        choices=("auto", "cuda", "torch"),
+        default=os.environ.get("MEMFLORA_BITPACK_BACKEND", "auto"),
+        help="auto builds CUDA packing if available; cuda requires it; torch disables it",
+    )
+    parser.add_argument(
+        "--empty-cache-after-calibration",
+        action="store_true",
+        help="release unused CUDA cache after calibration; does not free live tensors",
+    )
+    parser.add_argument(
+        "--trace-stacks",
+        action="store_true",
+        help="record allocation stacks (adds profiler overhead)",
+    )
+    parser.add_argument(
+        "--save-snapshot",
+        action="store_true",
+        help="save each CUDA trace for PyTorch memory_viz",
+    )
+    parser.add_argument("--reverse-order", action="store_true", help="measure Full FT first")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--out", type=Path, help="default: runs/jetson_memory_*")
     parser.add_argument("--cpu", action="store_true", help="measure on the CPU")
     parser.add_argument("--child", help=argparse.SUPPRESS)  # the method to measure
     cli = parser.parse_args()
+    if cli.rank <= 0 or cli.batch <= 0:
+        parser.error("--rank and --batch must be positive")
+    os.environ["MEMFLORA_BITPACK_BACKEND"] = cli.bitpack_backend
     sys.stdout.reconfigure(line_buffering=True)
     if cli.child:
         measure(cli, cli.child)
@@ -527,7 +707,7 @@ def main() -> int:
         "title": f"{MODELS[cli.model][0]}: MemFLoRA (rank {cli.rank}) vs full"
         f" fine-tuning, batch {cli.batch}, AdaBN {'on' if cli.use_adabn else 'off'}",
         "t0": time.time(),
-        "runs": list(RUNS),
+        "runs": list(reversed(RUNS)) if cli.reverse_order else list(RUNS),
         "samples": [],
         "stages": [],
         "results": {},
@@ -538,8 +718,9 @@ def main() -> int:
     def save() -> None:
         with LOCK:
             text = json.dumps(report)
-        (out / "data.json.tmp").write_text(text)
-        os.replace(out / "data.json.tmp", out / "data.json")
+            # The periodic saver and shutdown path share this temporary file.
+            (out / "data.json.tmp").write_text(text)
+            os.replace(out / "data.json.tmp", out / "data.json")
 
     def keep_saving() -> None:
         while True:
@@ -565,9 +746,9 @@ def main() -> int:
         tunnel = f"ssh -L {cli.port}:localhost:{cli.port} <jetson>"
         print(f"over SSH, run this on your laptop first: {tunnel}")
 
-    for label, method in RUNS.items():
+    for label in report["runs"]:
         time.sleep(3)  # a short gap between the runs on the charts
-        run_child(label, method, report, monitor)
+        run_child(label, RUNS[label], report, monitor)
     with LOCK:
         report["done"] = True
     print()
@@ -646,28 +827,32 @@ svg { display: block; width: 100%; }
         forward pass, temporaries allocated during the step, and blocks that existed
         before it. The allocator's cache and rounding make up the rest of what it had
         reserved. The replayed peak is checked against PyTorch's own peak
-        counter.</li>
+        requested-byte counter. The maximum reserved memory is checked separately;
+        those checks do not validate the category labels or Linux RSS.</li>
       <li><b>The step timelines.</b> The same replay over the whole step: what is
         kept between steps, saved tensors, gradients and temporaries, stacked, with
-        the memory the allocator had reserved as a dashed line.</li>
-      <li><b>Process memory.</b> Everything else comes from the measured process's
-        own counters in <code>/proc/&lt;pid&gt;/status</code>: private memory
-        (RssAnon + RssShmem) and library files mapped from disk (RssFile). Neither
-        depends on other processes or on which method ran first. On a Jetson the GPU
-        shares the RAM, so PyTorch's GPU buffers are part of the private memory, and
-        each phase is charged what it added minus what the allocator reserved in it.
-        The first three blocks add up to about the process's private memory.</li>
-      <li><b>Mapped library files.</b> They count in RSS (what <code>top</code>
-        shows), but the kernel can drop these pages and read them again from disk,
-        so they are kept out of the totals.</li>
-      <li><b>Grouping.</b> The first three tiles and the first block follow Table 3
-        of the paper (peak training state, saved activations, optimizer state), but
-        every number here is measured on the device.</li>
+        reserved memory as a dashed line. The horizontal axis is allocator event
+        order, not elapsed time. Each category in the breakdown is a snapshot at
+        the overall requested peak; it is not that category's maximum.</li>
+      <li><b>Process memory.</b> Linux RSS is anonymous + shared-memory + file-backed
+        resident pages. Private pages and PSS are read separately from
+        <code>smaps_rollup</code>, where available. These overlap with each other
+        and potentially with CUDA allocations. They must not be added to the CUDA
+        breakdown. GPU inclusion in RSS depends on the JetPack/kernel version.
+        Process counters are sampled after synchronization, not at the CUDA peak.</li>
+      <li><b>Comparison with the paper.</b> Maximum training state and saved state
+        at the end of forward are reported separately from total execution memory.
+        The saved-state total includes packed masks and small backward constants.
+        CUDA temporaries, checkpoint copies and allocator cache are additional costs.
+        Inputs and weights here are synthetic; no accuracy experiment is run.</li>
     </ul>
   </div>
   <div class="card" id="breakdown" hidden><table id="table"></table></div>
   <div id="steps"></div>
   <div id="charts"></div>
+  <details class="card"><summary>Run configuration and build information</summary>
+    <pre id="metadata" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+  </details>
   <div class="sub">Raw samples: <a href="data.json">data.json</a></div>
 </main>
 <div id="tip" hidden></div>
@@ -678,7 +863,7 @@ const MB = (b) => (b == null ? "n/a" : (b / 1e6).toFixed(2) + " MB");
 const NS = "http://www.w3.org/2000/svg";
 const CHARTS = [
   ["Memory of the measured process", "MB",
-    [["Private memory", "private"], ["Mapped library files", "files"]]],
+    [["Process RSS", "rss"], ["File-backed RSS (included in total)", "files"]]],
   ["GPU load", "%", [["GPU", "gpu"]], 100],
   ["CPU load", "%", [["Average of all cores", "cpu"], ["Busiest core", "cpu_max"]], 100],
   ["Input power", "W", [["VDD_IN", "power"]]],
@@ -689,34 +874,27 @@ const NOTES = {  // shown under each block and row of the table
     "What training itself holds at the moment of the step's peak.",
   "Other PyTorch memory at the peak":
     "The rest of what PyTorch's allocator had reserved at that moment.",
-  "Outside PyTorch's allocator: this process":
-    "Private memory each phase added to the process, minus the allocator's own growth.",
-  "Mapped library files, not counted above":
-    "Resident, but the kernel can drop these pages and read them again from disk.",
+  "Process RSS after the step (separate accounting view)":
+    "Linux resident pages after synchronization. Do not add this to CUDA memory.",
   "Model state": "Every weight and buffer: frozen backbone, adapters, BatchNorm statistics.",
   "Optimizer state": "Adam's two moment buffers for each trainable weight.",
   "Parameter gradients": "Gradients already computed when the peak happens.",
-  "Saved activations": "Tensors autograd saved in this step's forward pass and still " +
-    "holds at the peak, each storage counted once.",
-  "Saved ReLU bitmasks": "MemFLoRA's bit-packed ReLU signs still held at the peak.",
+  "Saved activations": "Saved non-mask storage alive at the overall peak, including " +
+    "small backward constants. The end-of-forward total is reported separately.",
+  "Saved ReLU bitmasks": "Packed ReLU/ReLU6 gates alive at the overall peak. " +
+    "Zero is possible when the peak precedes mask creation; see the forward-end tile.",
   "Temporaries and workspace": "Everything else allocated during the step and alive at " +
     "the peak: layer outputs, gradients flowing backward, cuDNN workspaces.",
   "Input batch": "The current mini-batch of windows and labels.",
   "Best-checkpoint copy": "The benchmark keeps a copy of the weights to restore its best " +
     "step.",
   "Other allocations kept between steps": "Allocated before the step by something other " +
-    "than the tensors above, mostly library workspaces such as cuBLAS's.",
+    "than the tensors above. Their individual owners have not been identified.",
   "Allocator cache and rounding": "Reserved from the driver but not requested by any " +
-    "tensor at the peak: cached free blocks, and each block's rounding.",
-  "Python interpreter": "Private memory of Python and this script's imports at the start.",
-  "PyTorch import": "Loading PyTorch and the CUDA libraries it links.",
-  "Project imports": "This repository's modules, and torchvision for MobileNetV2.",
-  "CUDA context and driver": "Created by the first GPU operation.",
-  "Model and data setup": "Host memory used while building the model and the batch.",
-  "cuDNN and cuBLAS at first use": "Kernels, library handles and caches, loaded from " +
-    "the model's first use up to the end of the measured step.",
-  "Library files mapped into the process": "Code of Python, PyTorch, CUDA and cuDNN " +
-    "mapped from disk (RssFile).",
+    "tensor at the peak: cached blocks, rounding and pending stream-delayed frees.",
+  "Anonymous resident pages": "RssAnon; not an allocator or library attribution.",
+  "Shared-memory resident pages": "RssShmem, which includes shared anonymous and tmpfs mappings.",
+  "File-backed resident pages": "RssFile: all resident file mappings, not only library code.",
 };
 let data = null, hoverT = null;
 
@@ -768,9 +946,11 @@ function render() {
     $("status").append(node("span", " · allocator trace does not match PyTorch's peak " +
       "counter, peak rows are unreliable", "warn"));
   } else if (checks.length && checks.every((v) => v === true)) {
-    $("status").append(" · peaks checked against PyTorch's counter");
+    $("status").append(" · requested/reserved peaks checked; category attribution is not independently verified");
   }
   if (first) renderTables(d, results, first);
+  $("metadata").textContent = JSON.stringify(Object.fromEntries(
+    d.runs.map((run) => [run, d.results[run]?.metadata || null])), null, 2);
   $("steps").replaceChildren();
   drawSteps(d);
   $("charts").replaceChildren();

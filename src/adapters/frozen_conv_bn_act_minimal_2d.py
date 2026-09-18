@@ -19,6 +19,7 @@ from src.adapters._common import (
     _prepare_activation_mask,
     activation_grad,
     scale_channels,
+    fused_activation_inplace,
 )
 
 
@@ -44,21 +45,29 @@ class FrozenConvBNActMinimal2DFunction(Function):
             dilation=base.dilation,
             groups=base.groups,
         )
-        bn_out = conv_out * bn_scale.view(1, -1, 1, 1) + bn_shift.view(1, -1, 1, 1)
+        # Preserve out-of-place type promotion under autocast while reusing the
+        # convolution buffer when its dtype already matches the BN parameters.
+        bn_out = conv_out.to(torch.promote_types(conv_out.dtype, bn_scale.dtype))
+        del conv_out
+        bn_out.mul_(bn_scale.view(1, -1, 1, 1))
+        bn_out = bn_out.to(torch.promote_types(bn_out.dtype, bn_shift.dtype))
+        bn_out.add_(bn_shift.view(1, -1, 1, 1))
         ctx.activation_mask_shape = tuple()
         if activation == 0:
             y = bn_out
             activation_mask = torch.empty(0, device=x.device, dtype=torch.uint8)
+        elif activation_mask_mode == 1:
+            y, activation_mask = fused_activation_inplace(ctx, bn_out, activation)
         elif activation == 1:
             mask = bn_out > 0
             activation_mask = _prepare_activation_mask(mask, activation_mask_mode)
             ctx.activation_mask_shape = tuple(mask.shape)
-            y = torch.relu(bn_out)
+            y = torch.relu_(bn_out)
         elif activation == 2:
             mask = (bn_out > 0) & (bn_out < 6)
             activation_mask = _prepare_activation_mask(mask, activation_mask_mode)
             ctx.activation_mask_shape = tuple(mask.shape)
-            y = torch.clamp(bn_out, min=0, max=6)
+            y = bn_out.clamp_(min=0, max=6)
         else:
             raise NotImplementedError(f"Unsupported activation code: {activation}")
         ctx.needs_x_grad = bool(ctx.needs_input_grad[0])
