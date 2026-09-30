@@ -182,6 +182,7 @@ def inject_adapters(
             rank=rank,
             backbone=backbone,
             adapter_layers=adapter_layers,
+            optimized=method == "lora_edge_optimized",
             optimized_v2=method == "lora_edge_optimized_v2",
         )
         return _require_adapter_replacements(method, adapter_layers, replaced)

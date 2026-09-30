@@ -11,7 +11,7 @@ See docs/jetson_table3.md for scope, inclusion rules, and validation limits.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 import csv
 from datetime import datetime, timezone
@@ -40,6 +40,21 @@ METHODS = {
     "lora_edge": ("LoRA-Edge", "lora_edge_optimized"),
     "memflora": ("MemFLoRA", "bnpa_fa_postbn_bnr_off_scaled"),
     "memflora_sg": ("MemFLoRA-SG", "bnpa_q3_sg"),
+}
+# Exact printed reference, NOT corrected values or target measurements.
+PAPER_SOURCE = "MemFLoRA (58).pdf, Table 3, page 5 (2026-09-30 version)"
+PAPER_BATCHES = (1, 8, 32, 64)
+PAPER_TABLE3 = {
+    ("tresnet", "full"): ([(9.02, .90), (13.84, 7.09), (35.08, 28.33), (63.40, 56.65)], 4.49),
+    ("tresnet", "lora_c"): ([(5.51, 3.10), (11.53, 9.12), (32.20, 29.79), (59.76, 57.35)], .10),
+    ("tresnet", "lora_edge"): ([(2.93, .60), (7.05, 4.72), (21.19, 18.86), (40.04, 37.71)], .02),
+    ("tresnet", "memflora"): ([(2.44, .02), (2.50, .11), (2.81, .42), (3.23, .83)], .08),
+    ("tresnet", "memflora_sg"): ([(2.50, .02), (2.78, .11), (3.74, .42), (5.01, .83)], .10),
+    ("mobilenetv2", "full"): ([(43.20, 16.12), (109.00, 81.91), (346.93, 319.85), (666.64, 639.56)], 17.97),
+    ("mobilenetv2", "lora_c"): ([(27.17, 17.61), (90.00, 80.44), (305.40, 295.84), (592.61, 583.05)], .30),
+    ("mobilenetv2", "lora_edge"): ([(17.09, 7.66), (69.77, 60.34), (250.39, 240.96), (491.22, 481.79)], .16),
+    ("mobilenetv2", "memflora"): ([(9.63, .20), (10.54, 1.11), (13.66, 4.23), (17.83, 8.40)], .16),
+    ("mobilenetv2", "memflora_sg"): ([(9.91, .20), (11.73, 1.11), (17.97, 4.23), (26.30, 8.40)], .16),
 }
 BASE_STATE = {"model", "optimizer", "projection_optimizer"}
 EXCLUDED = {"input", "checkpoint"}
@@ -214,6 +229,7 @@ def parser():
     p.add_argument("--max-events", type=int, default=1000000)
     p.add_argument("--allow-bitpack-fallback", action="store_true", help="Allow PyTorch mask packing if the compiled CUDA backend is unavailable")
     p.add_argument("--dry-run", action="store_true", help="List the sweep without importing PyTorch or creating outputs")
+    p.add_argument("--preflight", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--worker-model", choices=MODELS, help=argparse.SUPPRESS)
     p.add_argument("--worker-method", choices=METHODS, help=argparse.SUPPRESS)
     p.add_argument("--worker-batch", type=int, help=argparse.SUPPRESS)
@@ -326,7 +342,7 @@ def case_config(args):
     }
 
 
-def measure(args):
+def prepare_runtime(args):
     # Set before importing torch. Preserve explicit user choices and record them.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
     if not any(k in os.environ for k in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")):
@@ -346,6 +362,53 @@ def measure(args):
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = False
     sys.path.insert(0, str(args.repo_root.resolve()))
+    return torch, device
+
+
+def runtime_preflight(args):
+    """Exit this process before measurement workers create CUDA contexts."""
+    torch, device = prepare_runtime(args)
+    # Verify shared imports too, without building a model or compiling kernels.
+    import experiments.minimal_methods_benchmark  # noqa: F401
+    import experiments.benchmark_training  # noqa: F401
+    print(f"Python: {sys.executable}; PyTorch: {torch.__version__}; CUDA device: {device}")
+
+
+def check_environment(args):
+    command = [sys.executable, str(Path(__file__).resolve()), "--preflight",
+               "--repo-root", str(args.repo_root.resolve()), "--device", args.device,
+               "--threads", str(args.threads), "--seed", str(args.seed)]
+    print("Checking Python/CUDA environment before starting cases...", flush=True)
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode:
+        print(f"Environment check failed for {sys.executable}. No cases were started.", file=sys.stderr)
+        print(completed.stdout + completed.stderr, file=sys.stderr)
+        print("Activate your CUDA-enabled MemFLoRA environment, or use its Python explicitly "
+              "(on your Jetson: ~/venvs/memflora/bin/python tools/jetson_profile.py).", file=sys.stderr)
+        return False
+    print(completed.stdout.strip(), flush=True)
+    if completed.stderr:
+        print(completed.stderr.strip(), file=sys.stderr)
+    return True
+
+
+def audit_method_implementation(model, method):
+    """Allocator checks cannot detect a wrongly selected adapter class."""
+    counts = dict(sorted(Counter(type(m).__name__ for m in model.modules()).items()))
+    if method == "lora_edge":
+        from src.adapters.lora_edge import LoRAEdgeConv2d, LoRAEdgeConv2dOptimized
+        adapters = [m for m in model.modules() if isinstance(m, LoRAEdgeConv2d)]
+        if not adapters or any(type(m) is not LoRAEdgeConv2dOptimized for m in adapters):
+            raise RuntimeError(
+                "LoRA-Edge implementation mismatch: expected LoRAEdgeConv2dOptimized "
+                "at every selected site. Check optimized=True in the adapter factory. "
+                f"Observed module classes: {counts}"
+            )
+    return counts
+
+
+def measure(args):
+    torch, device = prepare_runtime(args)
     from experiments.benchmark_cli import apply_dataset_defaults, parse_args
     from experiments.benchmark_common import prepare_batch_inputs, method_forces_bn_eval
     from experiments.benchmark_training import SGSession, changing_state
@@ -373,6 +436,8 @@ def measure(args):
     model = build_backbone(settings).to(device)
     configure_method(model, settings)
     model.to(device)
+    module_classes = audit_method_implementation(model, args.worker_method)
+    print(f"Implementation classes: {module_classes}", flush=True)
     sg = SGSession(model, BNPASGConfig(p_lr=config["sg_projection_lr"])) if args.worker_method == "memflora_sg" else None
     optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3, weight_decay=0.0005)
     optimizers = [optimizer, sg.optimizer] if sg else [optimizer]
@@ -518,6 +583,8 @@ def measure(args):
     metrics["cuda_allocated_peak_bytes"] = counters["allocated_bytes.all.peak"]
     metrics["saved_nonmask_end_forward_bytes"] = metrics["saved_backward_end_forward_bytes"] - metrics["saved_bitmasks_end_forward_bytes"]
     checks = {
+        "lora_edge_class_matches_request": args.worker_method != "lora_edge" or
+            module_classes.get("LoRAEdgeConv2dOptimized", 0) > 0,
         "requested_peak_matches_counter": metrics["cuda_requested_peak_bytes"] == counters["requested_bytes.all.peak"],
         "reserved_peak_matches_counter": metrics["cuda_reserved_peak_bytes"] == counters["reserved_bytes.all.peak"],
         "training_peak_partition": sum(result["training_peak_components"].values()) == metrics["training_state_peak_bytes"],
@@ -533,7 +600,8 @@ def measure(args):
     for name, requested in observer.phase_requested.items():
         checks[name + "_requested_matches_counter"] = result["phase_states"][name]["requested"] == requested
     result.update(config=config, status="ok" if all(checks.values()) else "invalid",
-                  checks=checks, provenance=provenance(args, torch, device))
+                  checks=checks, module_class_counts=module_classes,
+                  provenance=provenance(args, torch, device))
     return result
 
 
@@ -600,6 +668,76 @@ def export_results(out, args, results):
             row[short + "_reduction_percent"] = 100 * (1 - result["metrics"][metric] / denominator) if denominator else ""
         reductions.append(row)
     dump_csv(out / "reductions.csv", reductions, ["model", "method", "batch", "peak_training_reduction_percent", "saved_backward_reduction_percent", "requested_cuda_reduction_percent"])
+    export_paper_comparison(out, args, results)
+
+
+def comparison_status(result, rank):
+    if rank != 2:
+        return "RANK MISMATCH"
+    if result is None:
+        return "PENDING"
+    if result["status"] != "ok":
+        return "FAILED"
+    if result["config"].get("rank") != 2:
+        return "RANK MISMATCH"
+    if (result["config"]["method"] == "lora_edge" and
+            not result.get("checks", {}).get("lora_edge_class_matches_request", False)):
+        return "UNVERIFIED IMPLEMENTATION"
+    return "ok"
+
+
+def export_paper_comparison(out, args, results):
+    """Same grid as Table 3, paired paper/Jetson rows; never invent missing cells."""
+    lookup = {(r["config"]["model"], r["config"]["method"], r["config"]["batch"]): r for r in results}
+    header = ["Backbone", "Method", "Source"] + [f"B={b} peak / saved [MB]" for b in PAPER_BATCHES] + ["Optimizer [MB]"]
+    md = ["# Table 3: paper versus Jetson", "", f"Reference: {PAPER_SOURCE}.", "",
+          "Each paper row is followed by its Jetson row. Entries are peak / saved state in decimal MB; optimizer is already included in peak.", "",
+          "| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * len(header)) + " |"]
+    rows = []
+    for model in MODELS:
+        for method in METHODS:
+            reference, paper_opt = PAPER_TABLE3[model, method]
+            paper_cells, jetson_cells, opts, statuses = [], [], set(), []
+            for batch, (paper_peak, paper_saved) in zip(PAPER_BATCHES, reference):
+                paper_cells.append(f"{paper_peak:.2f} / {paper_saved:.2f}")
+                result = lookup.get((model, method, batch))
+                status = comparison_status(result, args.rank)
+                statuses.append(status)
+                row = {"backbone": MODELS[model][0], "method": METHODS[method][0],
+                       "batch": batch, "status": status, "paper_source": PAPER_SOURCE,
+                       "paper_peak_mb": paper_peak, "paper_saved_mb": paper_saved,
+                       "paper_optimizer_mb": paper_opt}
+                if status == "ok":
+                    m = result["metrics"]
+                    peak, saved, opt = (m[k] / 1e6 for k in
+                        ("training_state_peak_bytes", "saved_backward_end_forward_bytes", "optimizer_total_bytes"))
+                    jetson_cells.append(f"{peak:.2f} / {saved:.2f}")
+                    opts.add(m["optimizer_total_bytes"])
+                    row.update(jetson_peak_bytes=m["training_state_peak_bytes"],
+                               jetson_saved_bytes=m["saved_backward_end_forward_bytes"],
+                               jetson_optimizer_bytes=m["optimizer_total_bytes"],
+                               jetson_peak_mb=peak, jetson_saved_mb=saved, jetson_optimizer_mb=opt,
+                               delta_peak_mb=round(peak-paper_peak, 6),
+                               delta_saved_mb=round(saved-paper_saved, 6),
+                               delta_optimizer_mb=round(opt-paper_opt, 6))
+                else:
+                    jetson_cells.append(status)
+                rows.append(row)
+            if all(status == "ok" for status in statuses):
+                opt_cell = f"{next(iter(opts))/1e6:.2f}" if len(opts) == 1 else "VARIES"
+            else:
+                opt_cell = "INCOMPLETE"
+            for source, cells, opt in [("Paper", paper_cells, f"{paper_opt:.2f}"), ("Jetson", jetson_cells, opt_cell)]:
+                md.append("| " + " | ".join([MODELS[model][0], METHODS[method][0], source, *cells, opt]) + " |")
+    md.extend(["", "Paper values are transcribed exactly, including the known MobileNetV2 Full FT saved-state cells (16.12 and 81.91) and SG optimizer cell (0.16). They are references, not targets or validated corrections.",
+               "", "CSV deltas are Jetson minus the PRINTED, rounded paper value, not differences from the original unrounded experiment. The paper uses historical reference-counting/single-buffer estimates; Jetson uses distinct concurrent backing allocations. Differences are not automatically hardware effects.",
+               "", "Paper rank is 2. Missing, failed, rank-mismatched or unverified LoRA-Edge cells have no numerical comparison. Partial sweeps leave the other cells PENDING. Optimizer is marked INCOMPLETE until all four batches of a row are verified.",
+               "", "All 40 cells are retained in paper order even for a subset run. Non-paper batch sizes are available in table3.md and measurements.csv, not this comparison."])
+    (out / "table3_comparison.md").write_text("\n".join(md) + "\n")
+    fields = ["backbone", "method", "batch", "status", "paper_source", "paper_peak_mb", "paper_saved_mb", "paper_optimizer_mb",
+              "jetson_peak_bytes", "jetson_saved_bytes", "jetson_optimizer_bytes", "jetson_peak_mb", "jetson_saved_mb", "jetson_optimizer_mb",
+              "delta_peak_mb", "delta_saved_mb", "delta_optimizer_mb"]
+    dump_csv(out / "table3_comparison.csv", rows, fields)
 
 
 def main(argv=None):
@@ -612,6 +750,13 @@ def main(argv=None):
     for name in ("models", "methods", "batches"):
         if len(set(getattr(args, name))) != len(getattr(args, name)):
             p.error(f"Duplicate --{name} entries")
+    if args.preflight:
+        try:
+            runtime_preflight(args)
+        except Exception as exc:
+            print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        return 0
     if args.worker_model:
         if not args.worker_method or not args.worker_batch or args.worker_output is None:
             p.error("Incomplete worker arguments")
@@ -634,6 +779,8 @@ def main(argv=None):
     out = out.resolve()
     if out.exists():
         p.error(f"Output already exists; choose a new path: {out}")
+    if not check_environment(args):
+        return 1
     out.mkdir(parents=True)
     case_dir = out / "cases"
     case_dir.mkdir()
@@ -641,6 +788,7 @@ def main(argv=None):
                                    "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                                    "cases": cases, "order": "one serial pass; no reverse-order repetition"})
     results = []
+    export_results(out, args, results)
     print(f"Output: {out}\n{len(cases)} isolated memory-only cases; no pretraining or accuracy evaluation.", flush=True)
     for i, (model, method, batch) in enumerate(cases, 1):
         stem = f"{model}_{method}_b{batch}_r{args.rank}"
@@ -669,9 +817,11 @@ def main(argv=None):
             m = result["metrics"]
             print(f'  {m["training_state_peak_bytes"]/1e6:.6f} / {m["saved_backward_end_forward_bytes"]/1e6:.6f} MB; optimizer {m["optimizer_total_bytes"]/1e6:.6f} MB', flush=True)
         else:
-            print(f"  {result['status'].upper()}: inspect {case_dir / (stem + '.log')}", flush=True)
+            detail = result.get("error") or ", ".join(k for k, v in result.get("checks", {}).items() if not v)
+            print(f"  {result['status'].upper()}: {detail}; inspect {case_dir / (stem + '.log')}", flush=True)
     failures = sum(r["status"] != "ok" for r in results)
     print(f"Finished: {len(results)-failures}/{len(cases)} valid cases. Table: {out / 'table3.md'}", flush=True)
+    print(f"Paper comparison: {out / 'table3_comparison.md'}", flush=True)
     return 1 if failures else 0
 
 
