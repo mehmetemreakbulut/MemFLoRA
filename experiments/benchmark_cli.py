@@ -73,6 +73,8 @@ def parse_args(argv=None):
         default="imu13",
     )
     parser.add_argument("--method", nargs="+", choices=METHODS, default=["bnpa"])
+    parser.add_argument("--runtime-mode", choices=("reference", "optimized"), default="reference",
+                        help="Opt-in runtime optimizations; changes runtime memory, not the method")
     parser.add_argument("--rank", "--ranks", nargs="+", type=int, default=[2, 4, 8])
     parser.add_argument(
         "--adapter-layers",

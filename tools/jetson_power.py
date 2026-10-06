@@ -160,6 +160,7 @@ def build_workload(args, torch, device):
     ])
     apply_dataset_defaults(settings)
     settings.method, settings.rank = method, args.rank
+    settings.runtime_mode = getattr(args, "runtime_mode", "reference")
     settings.bnpa_bottleneck_bn = "on"
     model = build_backbone(settings).to(device)
     configure_method(model, settings)
@@ -175,11 +176,19 @@ def build_workload(args, torch, device):
     y = torch.randint(17, (args.batch,), device=device, generator=generator)
     criterion = torch.nn.CrossEntropyLoss()
     bn_eval = method_forces_bn_eval(method)
-
-    def update():
+    optimized = settings.runtime_mode == "optimized"
+    if optimized:
+        # Common loop optimization applies to baselines too. No evaluation or
+        # other mode transition occurs between power-benchmark updates.
         model.train()
         if bn_eval:
             freeze_bn_eval(model)
+
+    def update():
+        if not optimized:
+            model.train()
+            if bn_eval:
+                freeze_bn_eval(model)
         optimizer.zero_grad(set_to_none=True)
         with sg.begin() if sg else nullcontext():
             loss = criterion(model(x), y)
@@ -250,12 +259,14 @@ def measure(args):
     active = power_window(collector.samples, start, end, max_gap)
     metrics = make_metrics(idle, active, updates)
     return {"status": "ok", "model": args.worker_model, "method": args.worker_method,
+            "runtime_mode": args.runtime_mode,
             "repeat": args.repeat, "batch": args.batch, "rank": args.rank,
             "seed": args.seed, "updates": updates, "metrics": metrics,
             "idle_window": idle, "active_window": active,
             "warning": "Nonpositive idle-subtracted power; inspect baseline/telemetry" if metrics["above_idle_w"] <= 0 else None,
             "module_class_counts": classes, "provenance": info,
             "protocol": {"warmup_seconds": args.warmup_seconds, "settle_seconds": args.settle_seconds,
+                         "runtime_mode": args.runtime_mode,
                          "idle_seconds": args.idle_seconds, "requested_active_seconds": args.seconds,
                          "interval_ms": args.interval_ms, "sync_every": args.sync_every,
                          "baseline": "same loaded process, post-warmup, no training",
@@ -269,7 +280,11 @@ def summary_rows(results, models, methods, repeats):
     for model in models:
         for method in methods:
             group = [r for r in results if r["model"] == model and r["method"] == method and r["status"] == "ok"]
+            modes = {r.get("runtime_mode", "reference") for r in group}
+            if len(modes) > 1:
+                raise ValueError("Cannot average reference and optimized runtime results")
             row = {"model": model, "method": method, "valid_repeats": len(group),
+                   "runtime_mode": next(iter(modes), "unknown"),
                    "status": "ok" if len(group) == repeats else "incomplete"}
             for metric in METRICS:
                 values = [r["metrics"][metric] for r in group]
@@ -297,6 +312,8 @@ def parse_args(argv=None):
     p.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--rank", type=int, default=2)
+    p.add_argument("--runtime-mode", choices=("reference", "optimized"), default="reference",
+                   help="Opt-in runtime changes; reference preserves the historical implementation")
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--seconds", type=float, default=30)
     p.add_argument("--idle-seconds", type=float, default=10)
@@ -366,7 +383,7 @@ def main(argv=None):
         print("Another power benchmark is already running", file=sys.stderr)
         return 1
     common = [sys.executable, str(Path(__file__).resolve()), "--repo-root", str(args.repo_root.resolve())]
-    for key in ("device", "threads", "batch", "rank", "seconds", "idle_seconds", "warmup_seconds", "settle_seconds", "interval_ms", "sync_every"):
+    for key in ("device", "threads", "batch", "rank", "runtime_mode", "seconds", "idle_seconds", "warmup_seconds", "settle_seconds", "interval_ms", "sync_every"):
         common += ["--" + key.replace("_", "-"), str(getattr(args, key))]
     print("Checking CUDA/imports and input-power telemetry...", flush=True)
     if subprocess.run(common + ["--preflight"]).returncode:

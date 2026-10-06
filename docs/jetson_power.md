@@ -19,6 +19,60 @@ For a small Full FT / MemFLoRA-only experiment:
 ~/venvs/memflora/bin/python tools/jetson_power.py --methods full memflora
 ```
 
+## Opt-in runtime optimizations
+
+The default `--runtime-mode reference` preserves the earlier execution path.
+To evaluate the new implementation, use the same setting for all methods:
+
+```bash
+~/venvs/memflora/bin/python tools/jetson_power.py --methods full memflora --runtime-mode optimized
+```
+
+`optimized` removes redundant mode setup between updates, caches frozen BN
+coefficients, skips unused frozen-shift/projection gradient work, and fuses
+packed-mask gating plus channel scaling in the supported CUDA backward paths.
+It does not change the loss, learning rates, precision, rank, or method/BN policy.
+SG's replay/optimizer work remains intact. Custom backward paths outside the
+specialized MemFLoRA and frozen-convolution blocks are not all fused.
+
+The cache is invalidated by normal in-place BN updates, checkpoint loading,
+replacement, dtype/device changes and epsilon changes. Trainable BN coefficients
+and inference-mode forwards bypass it. Raw `.data` writes bypass PyTorch mutation
+tracking: invalidate with `configure_runtime_optimizations(model)` after such writes.
+The two cached vectors per frozen BN are **registered nonpersistent buffers**,
+visible to memory accounting but excluded from checkpoints. Optimized memory
+values are therefore new measurements, not replacements for historical tables.
+Runtime mode is recorded in JSON/CSV; mixed-mode averages are rejected.
+
+For a short timing/allocator check before a power run:
+
+```bash
+~/venvs/memflora/bin/python tools/jetson_runtime.py --model tresnet --trace
+~/venvs/memflora/bin/python tools/jetson_runtime.py --model mobilenetv2 --trace
+```
+
+These execute each Full FT/MemFLoRA reference/optimized case in a fresh process.
+Operator traces cover a separate three-update window, excluded from timing.
+CUDA kernel tracing requires working CUPTI access. If no CUDA kernels are
+captured, the diagnostic marks the trace CPU-only, emits a warning, and leaves
+device-time CSV fields blank; it does not interpret missing data as zero cost.
+Results are diagnostic, not a thermally controlled energy comparison. Do not run
+concurrently with another GPU workload. This does not enable `torch.compile` or
+CUDA graphs: evaluate those only after checking operator traces, compatibility,
+and memory costs. No speedup or energy improvement is assumed.
+
+Actual adaptation also accepts `--runtime-mode optimized` in
+`experiments/minimal_methods_benchmark.py`; validation-to-training transitions
+are preserved. Alternatively call `src.runtime.configure_runtime_optimizations`
+after adapter injection. The historical SRAM/Jetson memory profiler source is
+unchanged and continues to select the reference path by default.
+
+CPU and optional real-CUDA correctness tests:
+
+```bash
+python -m pytest tests -q
+```
+
 The output is just progress lines, `summary.csv` (one row per configuration,
 repeat means and sample standard deviations), `results.json` and per-repeat JSON/logs.
 No HTML report. Existing output directories are never overwritten. `--dry-run`

@@ -78,6 +78,15 @@ class PowerTests(unittest.TestCase):
         self.assertEqual(row["status"], "incomplete")
         self.assertIsNone(row["total_w"])
 
+    def test_runtime_mode_default_and_mixed_results(self):
+        self.assertEqual(power.parse_args([]).runtime_mode, "reference")
+        self.assertEqual(power.parse_args(["--runtime-mode", "optimized"]).runtime_mode, "optimized")
+        rows = [{"model": "tresnet", "method": "full", "status": "ok",
+                 "runtime_mode": mode, "metrics": dict.fromkeys(power.METRICS, 1)}
+                for mode in ("reference", "optimized")]
+        with self.assertRaisesRegex(ValueError, "Cannot average"):
+            power.summary_rows(rows, ["tresnet"], ["full"], 2)
+
     def test_summary_mean_and_sample_sd(self):
         rows = [{"model": "tresnet", "method": "full", "status": "ok", "metrics": dict.fromkeys(power.METRICS, v)} for v in (1, 3)]
         got = power.summary_rows(rows, ["tresnet"], ["full"], 2)[0]

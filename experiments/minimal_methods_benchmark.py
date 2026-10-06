@@ -88,15 +88,20 @@ def configure_method(model, args):
     if method in ("zero_shot", "full"):
         for parameter in model.parameters():
             parameter.requires_grad_(method == "full")
-        return []
-    return inject_adapters(
-        model,
-        method=method,
-        rank=args.rank,
-        backbone="t_resnet" if args.backbone == "t_resnet_official" else args.backbone,
-        adapter_layers=args.adapter_layers,
-        bnpa_bottleneck_bn=args.bnpa_bottleneck_bn,
-    )
+        layers = []
+    else:
+        layers = inject_adapters(
+            model,
+            method=method,
+            rank=args.rank,
+            backbone="t_resnet" if args.backbone == "t_resnet_official" else args.backbone,
+            adapter_layers=args.adapter_layers,
+            bnpa_bottleneck_bn=args.bnpa_bottleneck_bn,
+        )
+    if getattr(args, "runtime_mode", "reference") == "optimized":
+        from src.runtime import configure_runtime_optimizations
+        configure_runtime_optimizations(model)
+    return layers
 
 
 def iter_trials(args, method, split, loaders, target_domain):

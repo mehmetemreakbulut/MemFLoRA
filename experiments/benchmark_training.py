@@ -117,9 +117,12 @@ def fit_steps_best(
         "time_spec_reach_time_sec": "",
     }
     for step in range(1, steps + 1):
-        model.train()
-        if force_bn_eval:
-            freeze_bn_eval(model)
+        # Evaluation below switches the model to eval; restore on the next
+        # update, but avoid repeated recursive setup within an optimized run.
+        if not getattr(model, "_memflora_runtime_optimized", False) or step == 1 or not model.training:
+            model.train()
+            if force_bn_eval:
+                freeze_bn_eval(model)
         try:
             x, y = next(iterator)
         except StopIteration:

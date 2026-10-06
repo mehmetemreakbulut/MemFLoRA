@@ -26,6 +26,7 @@ RESULT_FIELDNAMES = (
     "backbone",
     "method",
     "base_method",
+    "runtime_mode",
     "target_domain",
     "rank",
     "seed",
@@ -64,6 +65,7 @@ def make_result_row(
         "backbone": args.backbone,
         "method": label,
         "base_method": args.method,
+        "runtime_mode": getattr(args, "runtime_mode", "reference"),
         "target_domain": args.target_domain,
         "rank": (
             0 if args.method in RANK_FREE_METHODS | {"zero_shot", "full"} else args.rank
@@ -172,9 +174,9 @@ def write_benchmark_config(result_dir, args):
 def write_benchmark_summary(path, rows):
     """Pool trial observations using the existing paper mean/std/stderr formulas."""
     groups = defaultdict(list)
-    keys = ("dataset", "backbone", "method", "rank", "steps_adapt", "batch_size")
+    keys = ("dataset", "backbone", "method", "rank", "steps_adapt", "batch_size", "runtime_mode")
     for row in rows:
-        groups[tuple(row[key] for key in keys)].append(row)
+        groups[tuple(row.get(key, "reference") if key == "runtime_mode" else row[key] for key in keys)].append(row)
     mean_fields = [
         "eval_accuracy",
         "delta_macro_f1_vs_zero_shot",

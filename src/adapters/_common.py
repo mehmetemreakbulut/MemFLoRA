@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from src.utils.adabn import update_batch_norm_running_stats
-from src.utils.bitpack import activate_and_pack_, pack_bool_mask, unpack_bool_mask
+from src.utils.bitpack import activate_and_pack_, masked_scaled_grad, pack_bool_mask, unpack_bool_mask
 
 ActivationMaskMode = Literal["bool", "bitpack"]
 
@@ -117,6 +117,16 @@ def scale_channels(
     return grad * view if grad is grad_output else grad.mul_(view)
 
 
+def activation_scaled_grad(grad_output, mask, scale, activation, mode, shape):
+    """Packed backward avoids an unpacked gate and separate scaling kernel."""
+    if activation and mode == 1:
+        if tuple(grad_output.shape) != tuple(shape):
+            raise ValueError("Activation-mask and gradient shapes differ")
+        return masked_scaled_grad(grad_output, mask, scale)
+    grad = activation_grad(grad_output, mask, activation, mode, shape)
+    return scale_channels(grad, scale, grad_output)
+
+
 def stash_fused_geometry(
     ctx,
     x: torch.Tensor,
@@ -211,7 +221,45 @@ class AdapterBlockCommon:
             f"Unsupported activation code: {self.activation_type}"
         )
 
+    def set_runtime_optimizations(self, enabled: bool) -> None:
+        self._runtime_optimized = bool(enabled)
+        for name in ("_runtime_bn_scale", "_runtime_bn_shift"):
+            if name not in self._buffers:
+                # Visible to memory accounting, but not saved in checkpoints.
+                self.register_buffer(name, None, persistent=False)
+        self.clear_runtime_cache()
+
+    def clear_runtime_cache(self) -> None:
+        self._runtime_bn_key = None
+        if "_runtime_bn_scale" in self._buffers:
+            self._runtime_bn_scale = self._runtime_bn_shift = None
+
     def _bn_scale_shift(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not getattr(self, "_runtime_optimized", False):
+            return self._compute_bn_scale_shift()
+        bn = self.batch_norm
+        if bn is None or bn.training or bn.running_mean is None or bn.running_var is None:
+            self.clear_runtime_cache()
+            return self._compute_bn_scale_shift()
+        tensors = [bn.running_mean, bn.running_var]
+        if bn.affine:
+            tensors += [bn.weight, bn.bias]
+        # Never cache a graph or trainable coefficients. Inference tensors have
+        # no mutation counter and therefore also use the uncached path.
+        if torch.is_inference_mode_enabled() or any(t.requires_grad or t.is_inference() for t in tensors):
+            self.clear_runtime_cache()
+            return self._compute_bn_scale_shift()
+        base = getattr(self, "base_conv", None)
+        ref = base.weight if base is not None else bn.running_mean
+        key = (ref.device, ref.dtype, bn.eps,
+               tuple((id(t), t.data_ptr(), t._version) for t in tensors))
+        if key != self._runtime_bn_key:
+            scale, shift = self._compute_bn_scale_shift()
+            self._runtime_bn_scale, self._runtime_bn_shift = scale, shift
+            self._runtime_bn_key = key
+        return self._runtime_bn_scale, self._runtime_bn_shift
+
+    def _compute_bn_scale_shift(self) -> Tuple[torch.Tensor, torch.Tensor]:
         base = getattr(self, "base_conv", None)
         ref = base.weight if base is not None else self.batch_norm.running_mean
         device, dtype = ref.device, ref.dtype

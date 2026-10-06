@@ -96,3 +96,26 @@ def unpack_bool_mask(packed: torch.Tensor, original_shape: torch.Size) -> torch.
     # Turn the byte of bits into 0/1 in place and read it as bool: one allocation.
     bits = torch.bitwise_and(values, weights).ne_(0).view(torch.bool)
     return bits.reshape(-1)[:numel].reshape(tuple(original_shape))
+
+
+def masked_scaled_grad(grad: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Apply a packed gate and NCHW channel scale without a full-width mask.
+
+    Writes a new output, never overwrites incoming gradients. Higher-order
+    differentiation and unsupported layouts use the differentiable torch path.
+    """
+    if grad.ndim != 4 or scale.ndim != 1 or scale.numel() != grad.shape[1]:
+        raise ValueError("Expected NCHW gradient and one scale per channel")
+    if packed.dtype != torch.uint8 or packed.numel() < (grad.numel() + 7) // 8:
+        raise ValueError("Invalid packed activation mask")
+    if packed.device != grad.device or scale.device != grad.device:
+        raise ValueError("Gradient, mask, and scale must share a device")
+    if (not torch.is_grad_enabled() and grad.is_cuda and grad.numel()
+            and grad.is_contiguous() and packed.is_contiguous() and scale.is_contiguous()
+            and grad.dtype == scale.dtype
+            and grad.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)):
+        extension = cuda_extension()
+        if extension is not None:
+            return extension.masked_scaled_grad(grad, packed, scale)
+    mask = unpack_bool_mask(packed, grad.shape)
+    return torch.where(mask, grad, 0) * scale.view(1, -1, 1, 1)

@@ -13,6 +13,7 @@ from torch.nn import grad as nn_grad
 from src.utils.adabn import batch_norm_train_output_from_preactivation
 from src.adapters._common import (
     activation_grad,
+    activation_scaled_grad,
     fused_activation_inplace,
     scale_channels,
     stash_fused_geometry,
@@ -333,6 +334,7 @@ class BNPAConvBNAct2DPostBNScaledOptimizedFunction(Function):
         base: ConvSpec,
         scale: float,
         activation: int,
+        runtime_optimized: bool,
     ) -> torch.Tensor:
         base_out = F.conv2d(
             x,
@@ -373,6 +375,7 @@ class BNPAConvBNAct2DPostBNScaledOptimizedFunction(Function):
         s = base_out
         y, activation_mask = fused_activation_inplace(ctx, s, activation)
         ctx.needs_x_grad = bool(ctx.needs_input_grad[0])
+        ctx.runtime_optimized = runtime_optimized
         ctx.has_u_bias = u_bias is not None
         if ctx.needs_x_grad:
             ctx.save_for_backward(
@@ -392,23 +395,25 @@ class BNPAConvBNAct2DPostBNScaledOptimizedFunction(Function):
         else:
             q, u_weight, bn_scale, activation_mask = ctx.saved_tensors
             base_weight = p_weight = None
-        g = activation_grad(
-            grad_output, activation_mask, ctx.activation, 1, ctx.activation_mask_shape
-        )
-        grad_bn_shift = g.sum(dim=(0, 2, 3))
-        # dL/dz of the base conv; the adapter output's gradient is this times scale,
-        # which is applied to the small results instead of a full-width copy.
-        grad_z = scale_channels(g, bn_scale, grad_output)
-        del g
-        grad_q = nn_grad.conv2d_input(
-            tuple(q.shape),
-            u_weight,
-            grad_z,
-            stride=ctx.u.stride,
-            padding=ctx.u.padding,
-            dilation=ctx.u.dilation,
-            groups=1,
-        ).mul_(ctx.scale)
+        if ctx.runtime_optimized and not ctx.needs_input_grad[9]:
+            grad_bn_shift = None
+            grad_z = activation_scaled_grad(
+                grad_output, activation_mask, bn_scale, ctx.activation, 1,
+                ctx.activation_mask_shape,
+            )
+        else:
+            g = activation_grad(
+                grad_output, activation_mask, ctx.activation, 1, ctx.activation_mask_shape
+            )
+            grad_bn_shift = g.sum(dim=(0, 2, 3))
+            grad_z = scale_channels(g, bn_scale, grad_output)
+            del g
+        grad_q = None
+        if ctx.needs_x_grad or not ctx.runtime_optimized:
+            grad_q = nn_grad.conv2d_input(
+                tuple(q.shape), u_weight, grad_z, stride=ctx.u.stride,
+                padding=ctx.u.padding, dilation=ctx.u.dilation, groups=1,
+            ).mul_(ctx.scale)
         grad_u_weight = nn_grad.conv2d_weight(
             q.detach(),
             ctx.u_weight_shape,
@@ -417,8 +422,10 @@ class BNPAConvBNAct2DPostBNScaledOptimizedFunction(Function):
             padding=ctx.u.padding,
             dilation=ctx.u.dilation,
             groups=1,
-        ).mul_(ctx.scale)
-        grad_u_bias = grad_z.sum(dim=(0, 2, 3)).mul_(ctx.scale) if ctx.has_u_bias else None
+        ).mul_(ctx.scale) if ctx.needs_input_grad[6] or not ctx.runtime_optimized else None
+        grad_u_bias = (grad_z.sum(dim=(0, 2, 3)).mul_(ctx.scale)
+                       if ctx.has_u_bias and (ctx.needs_input_grad[7] or not ctx.runtime_optimized)
+                       else None)
         grad_x = None
         if ctx.needs_x_grad:
             grad_x = nn_grad.conv2d_input(
@@ -451,6 +458,7 @@ class BNPAConvBNAct2DPostBNScaledOptimizedFunction(Function):
             grad_u_bias,
             None,
             grad_bn_shift,
+            None,
             None,
             None,
             None,
@@ -704,6 +712,7 @@ class BNPAConvBNAct2D(AdapterBlockCommon, ProjectionAdapterCommon, nn.Module):
                 conv_spec(self.base_conv),
                 self.scale,
                 self.activation_type,
+                getattr(self, "_runtime_optimized", False),
             )
         return BNPAConvBNAct2DFunction.apply(
             x,

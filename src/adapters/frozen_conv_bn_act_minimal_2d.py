@@ -18,6 +18,7 @@ from src.adapters._common import (
     _activation_mask_mode_code,
     _prepare_activation_mask,
     activation_grad,
+    activation_scaled_grad,
     scale_channels,
     fused_activation_inplace,
 )
@@ -35,6 +36,7 @@ class FrozenConvBNActMinimal2DFunction(Function):
         base: ConvSpec,
         activation: int,
         activation_mask_mode: int,
+        runtime_optimized: bool,
     ) -> torch.Tensor:
         conv_out = F.conv2d(
             x,
@@ -83,6 +85,7 @@ class FrozenConvBNActMinimal2DFunction(Function):
         ctx.base = base
         ctx.activation = int(activation)
         ctx.activation_mask_mode = int(activation_mask_mode)
+        ctx.runtime_optimized = runtime_optimized
         return y
 
     @staticmethod
@@ -92,16 +95,19 @@ class FrozenConvBNActMinimal2DFunction(Function):
         grad_bn_shift = None
         if ctx.needs_any_backward:
             base_weight, bn_scale, activation_mask = ctx.saved_tensors
-            g = activation_grad(
-                grad_output,
-                activation_mask,
-                ctx.activation,
-                ctx.activation_mask_mode,
-                ctx.activation_mask_shape,
-            )
-            if ctx.needs_bn_shift_grad:
-                grad_bn_shift = g.sum(dim=(0, 2, 3))
-            g = scale_channels(g, bn_scale, grad_output)  # now dL/d(conv output)
+            if ctx.runtime_optimized and not ctx.needs_bn_shift_grad:
+                g = activation_scaled_grad(
+                    grad_output, activation_mask, bn_scale, ctx.activation,
+                    ctx.activation_mask_mode, ctx.activation_mask_shape,
+                )
+            else:
+                g = activation_grad(
+                    grad_output, activation_mask, ctx.activation,
+                    ctx.activation_mask_mode, ctx.activation_mask_shape,
+                )
+                if ctx.needs_bn_shift_grad:
+                    grad_bn_shift = g.sum(dim=(0, 2, 3))
+                g = scale_channels(g, bn_scale, grad_output)
             if ctx.needs_base_bias_grad and ctx.has_base_bias:
                 grad_base_bias = g.sum(dim=(0, 2, 3))
             if ctx.needs_x_grad:
@@ -114,7 +120,7 @@ class FrozenConvBNActMinimal2DFunction(Function):
                     dilation=ctx.base.dilation,
                     groups=ctx.base.groups,
                 )
-        return (grad_x, None, grad_base_bias, None, grad_bn_shift, None, None, None)
+        return (grad_x, None, grad_base_bias, None, grad_bn_shift, None, None, None, None)
 
 
 class FrozenConvBNActMinimal2D(AdapterBlockCommon, nn.Module):
@@ -199,4 +205,5 @@ class FrozenConvBNActMinimal2D(AdapterBlockCommon, nn.Module):
             conv_spec(self.base_conv),
             self.activation_type,
             self.activation_mask_mode_code,
+            getattr(self, "_runtime_optimized", False),
         )
