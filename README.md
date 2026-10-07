@@ -78,15 +78,6 @@ are usually fine. If your data lives somewhere else, pass `--data-root`.
 
 ## Running things
 
-Start with the smoke test. It trains for one epoch on a single Opportunity subject
-and finishes in a few minutes, which is enough to tell you the data, the model
-and the adapters are all wired up correctly. Don't read anything into its
-accuracy.
-
-```bash
-make smoke
-```
-
 Everything goes through one entry point, `experiments/minimal_methods_benchmark.py`.
 Here's a realistic run: MemFLoRA at rank 4 on Opportunity with a T-ResNet, every
 subject held out in turn, five seeds, 50 adaptation steps.
@@ -127,18 +118,6 @@ For memory numbers, add `--profile-full-sram true`, and for multiply-accumulate
 counts add `--profile-performance true`. Both write their own CSVs next to the
 trial results.
 
-The `scripts/` folder has ready-made sweeps grouped by what they measure:
-accuracy, convergence over adaptation steps, memory profiling, design ablations, a
-TinyTL comparison and adaptation time. You can run a single script or a whole
-group:
-
-```bash
-./scripts/15_ablations_geometry.sh
-./scripts/run_all.sh ablations
-```
-
-Output goes to `$RESULTS_ROOT`, which defaults to `runs/`. Some of these sweeps
-are large and take days on a CPU, so read a script before you start it.
 
 ## Jetson memory report and CUDA packing
 
@@ -198,30 +177,7 @@ masks at the end of forward share one box. A zero mask row in the peak table can
 mean the peak occurred before masks were created or after they were released.
 Full fine-tuning does not use MemFLoRA's packed masks.
 
-**Process RAM** comes from Linux's own counters for the training process
-(`VmHWM` for the peak and `VmRSS` after the step, from `/proc/<pid>/status`), so
-it does not depend on other programs or on which method ran first. Whether the
-process's GPU buffers count toward it depends on the JetPack kernel; the report
-says so for each run, checked with a 32 MiB probe allocation. When they count, the
-GPU figures are already inside, so never add the two. Source hashes, software
-versions, and kernel backend status are included in the report's expandable build
-information.
 
-Both methods run with two cheap runtime settings, unless you set these variables
-yourself: `CUBLAS_WORKSPACE_CONFIG=:16:8` gives each cuBLAS handle a 128 KiB
-workspace instead of about 8 MiB, and
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` lets the allocator grow and
-shrink its segments instead of keeping fragmented ones. The build information
-records both, and whether expandable segments were actually active.
-
-The memory optimizations made after the paper's code are listed in
-[OPTIMIZATIONS.md](OPTIMIZATIONS.md).
-
-`--trace-stacks --save-snapshot` records allocation stacks and saves PyTorch
-allocator snapshots for investigation; stack recording adds overhead.
-`--reverse-order` measures full fine-tuning first. With calibration enabled,
-`--empty-cache-after-calibration` releases unused cached CUDA blocks after
-calibration; it does not free live tensors or guarantee a lower training peak.
 
 ## What's where
 
@@ -244,28 +200,3 @@ If you want to understand the method, start with
 `src/adapters/bnpa_conv_bn_act_2d.py`. The forward and backward of the fused
 Conv–BN–ReLU block are written out by hand there, and that's where the memory
 savings actually happen.
-
-## Tests and formatting
-
-```bash
-make test
-black --check src experiments tests
-```
-
-The tests don't need any data. They check bit packing, compare the BNPA backward
-against a plain autograd reference, and exercise adapter injection and the CSV
-output. Code is formatted with black at the default 88 columns.
-
-Compiled-kernel tests are opt-in and require CUDA and the build tools above:
-
-```bash
-MEMFLORA_TEST_CUDA_KERNEL=1 pytest tests/test_bitpack.py tests/test_fused_packing_blocks.py
-```
-
-These check byte order, tail padding, activation boundaries, non-default CUDA
-streams, and block outputs/gradients. `tests/test_jetson_memory.py` checks profiler
-accounting with synthetic traces and mocked Linux counters.
-
-## License
-
-MIT. See `LICENSE`.
